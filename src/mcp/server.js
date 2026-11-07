@@ -45,6 +45,17 @@
 // the handler pauses any autoplay and presses DOWN 2 immediately,
 // ending parked on the Videos row with the newest upload focused.
 //
+// v3.16: live testing proved v3.15's premise false — this SPA does
+// not route channels by URL at all (@handle, /user/, /channel/UC…;
+// hash and full reload all fall back to the home feed — the header
+// comment above said so all along). open_channel's primary route is
+// now the app's own path: resolve the channel's newest upload from
+// its RSS feed, load it with playVideoCore, and click the watch
+// page's byline element (its data carries the channel's browseId).
+// The URL strategies are demoted to last resort, AFTER the byline
+// and endpoint strategies they used to sabotage by destroying the
+// watch page. Creator browseIds are baked into CREATORS.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -66,6 +77,7 @@
 const crypto = require('crypto')
 const fs = require('fs')
 const http = require('http')
+const https = require('https')
 const path = require('path')
 
 const package = require('../../package.json')
@@ -202,10 +214,10 @@ function parseDurationText(text) {
 // null where the UC… id has not been recorded yet — resolution then
 // goes by handle/name, which open_channel handles.
 const CREATORS = [
-    { name: 'Asmongold TV', handle: 'AsmonTV', url: 'https://www.youtube.com/@AsmonTV', browseId: null, aliases: ['asmongold', 'asmon', 'asmongold tv', 'admin gold', 'as gold', 'aspen gold'] },
-    { name: 'Linus Tech Tips', handle: 'LinusTechTips', url: 'https://www.youtube.com/user/LinusTechTips', browseId: null, aliases: ['linus tech tips', 'linus', 'ltt', 'minus tech tips'] },
-    { name: 'Tectone', handle: 'Tectone', url: 'https://www.youtube.com/@Tectone', browseId: null, aliases: ['tectone'] },
-    { name: 'decoy', handle: 'decoy', url: 'https://www.youtube.com/@decoy', browseId: null, aliases: ['decoy', 'decoy voice', 'decoyvoice'] }
+    { name: 'Asmongold TV', handle: 'AsmonTV', url: 'https://www.youtube.com/@AsmonTV', browseId: 'UCQeRaTukNYft1_6AZPACnog', aliases: ['asmongold', 'asmon', 'asmongold tv', 'admin gold', 'as gold', 'aspen gold'] },
+    { name: 'Linus Tech Tips', handle: 'LinusTechTips', url: 'https://www.youtube.com/user/LinusTechTips', browseId: 'UCXuqSBlHAE6Xw-yeJA0Tunw', aliases: ['linus tech tips', 'linus', 'ltt', 'minus tech tips'] },
+    { name: 'Tectone', handle: 'Tectone', url: 'https://www.youtube.com/@Tectone', browseId: 'UCPnSoX7NkOBcOX0Gfw_yjAw', aliases: ['tectone'] },
+    { name: 'decoy', handle: 'decoy', url: 'https://www.youtube.com/@decoy', browseId: 'UCqN2iOW580CFSohYzruos2A', aliases: ['decoy', 'decoy voice', 'decoyvoice'] }
 ]
 
 // Resolve any channel reference (creator name, dictation alias,
@@ -1835,6 +1847,67 @@ function createMcpServer({ getWindow, context }) {
     // play_video's tile clicks and the search flow already prove),
     // the app's navigation event, and search + a trusted click on the
     // rendered channel entry. Throws with diagnostics on failure.
+    // Fetch a URL as text (server-side; used for channel RSS feeds
+    // and for resolving a handle to its UC... browseId from the
+    // channel page's own markup).
+    function fetchText(url, timeoutMs = 9000) {
+        return new Promise((resolve, reject) => {
+            let req = https.get(url, {
+                headers: {
+                    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+                    'Accept-Language': 'en-US,en;q=0.9'
+                }
+            }, (res) => {
+                if (res.statusCode >= 300 && res.statusCode < 400 && res.headers.location) {
+                    res.resume()
+                    resolve(fetchText(res.headers.location, timeoutMs))
+                    return
+                }
+                if (res.statusCode !== 200) {
+                    res.resume()
+                    reject(new Error('HTTP ' + res.statusCode + ' for ' + url))
+                    return
+                }
+                let chunks = []
+                res.on('data', (c) => chunks.push(c))
+                res.on('end', () => resolve(Buffer.concat(chunks).toString('utf8')))
+                res.on('error', reject)
+            })
+            req.setTimeout(timeoutMs, () => req.destroy(new Error('fetch timed out: ' + url)))
+            req.on('error', reject)
+        })
+    }
+
+    // The channel's newest upload IDs from its public RSS feed --
+    // deterministic and search-free. Entries are newest-first.
+    async function latestRssVideoIds(browseId, max = 3) {
+        let xml = await fetchText(`https://www.youtube.com/feeds/videos.xml?channel_id=${browseId}`)
+        let ids = []
+        for (let m of xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)) {
+            ids.push(m[1])
+            if (ids.length >= max) break
+        }
+        return ids
+    }
+
+    // Fill in a target's browseId when only a handle/name is known:
+    // the channel page's markup carries its own channelId.
+    async function resolveBrowseIdForTarget(target) {
+        try {
+            if (target.handle) {
+                let html = await fetchText(`https://www.youtube.com/@${target.handle}`)
+                let m = html.match(/"channelId":"(UC[\w-]{22})"/) || html.match(/\/channel\/(UC[\w-]{22})/)
+                if (m) return m[1]
+            }
+            if (target.name) {
+                let html = await fetchText(`https://www.youtube.com/user/${encodeURIComponent(target.name.replace(/\s+/g, ''))}`)
+                let m = html.match(/"channelId":"(UC[\w-]{22})"/) || html.match(/\/channel\/(UC[\w-]{22})/)
+                if (m) return m[1]
+            }
+        } catch (e) { /* best-effort; the strategies below still apply */ }
+        return null
+    }
+
     async function openChannelCore(target, rawLabel) {
         let webContents = getWebContents()
         let attempts = []
@@ -1868,40 +1941,6 @@ function createMcpServer({ getWindow, context }) {
             return n
         })()`).catch(() => 0)
 
-        // -- Strategy 0 (Matt's rule, 2026-11-06): navigate DIRECTLY
-        // to the channel's saved URL. Search is never used to reach
-        // a channel -- result layouts differ per channel and bury
-        // entries (LTT's members shelf pushes his entry 3 rows
-        // down). The app routes by hash, so the channel path is
-        // applied as the app's route: hash first (cheap), then a
-        // full load of the app on that route (the same fallback
-        // pair play_video uses). Only the rendered-state assertion
-        // can call either a success.
-        let directUrl = target.url ||
-            (target.browseId ? `https://www.youtube.com/channel/${target.browseId}` :
-             target.handle ? `https://www.youtube.com/@${target.handle}` :
-             target.name ? `https://www.youtube.com/user/${encodeURIComponent(target.name.replace(/\s+/g, ''))}` : null)
-        if (directUrl) {
-            let directPath = ''
-            try { directPath = new URL(directUrl).pathname } catch (e) {}
-            if (directPath) {
-                if (first && first.page === 'watch') {
-                    tapKey(webContents, 'Escape')
-                    await sleep(900)
-                }
-                let chanHash = '#' + directPath
-                await pauseAnyMedia()
-                await evalJS(webContents, `location.hash = ${JSON.stringify(chanHash)}; true`).catch(() => {})
-                let r = await waitForChannelScreen(6000)
-                attempts.push({ strategy: 'direct-url-hash', url: directUrl, matched: r.matched })
-                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-hash', attempts, screen: r.screen }
-                await webContents.loadURL(`${youtubeUrl}${chanHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
-                r = await waitForChannelScreen(9000)
-                attempts.push({ strategy: 'direct-url-load', url: directUrl, matched: r.matched })
-                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-load', attempts, screen: r.screen }
-            }
-        }
-
         // Smallest visible element whose own data references the
         // channel (optionally scoped to a subtree). Subscribe buttons
         // also carry the channel ID in their data — never click those.
@@ -1930,6 +1969,65 @@ function createMcpServer({ getWindow, context }) {
             }
             return best
         })()`).catch(() => null)
+
+        // -- Strategy A (v3.16, PRIMARY): the video-byline hop.
+        // The app's own path to a channel is through one of its
+        // videos: load the channel's newest upload (RSS --
+        // deterministic, no search), pause it, and click the watch
+        // page's byline element, whose data carries the channel's
+        // browseId (proven live 2026-11-06: the focused byline
+        // element on Asmongold TV's video carried UCQeRaTuk...).
+        // Runs FIRST: every other navigation attempt destroys the
+        // watch page this strategy depends on.
+        {
+            let hopBrowseId = target.browseId || await resolveBrowseIdForTarget(target)
+            attempts.push({ strategy: 'video-byline', browseId: hopBrowseId || null })
+            if (hopBrowseId) {
+                if (!target.browseId) target = { ...target, browseId: hopBrowseId }
+                let hopIds = await latestRssVideoIds(hopBrowseId).catch(() => [])
+                attempts.push({ strategy: 'video-byline', rssVideoIds: hopIds })
+                let findBylinePoint = async () => await evalJS(webContents, `(() => {
+                    const want = ${JSON.stringify(hopBrowseId)}
+                    let best = null, bestArea = Infinity
+                    for (const el of document.querySelectorAll('YTLR-WATCH-PAGE *')) {
+                        let hit = false
+                        try {
+                            const d = el.data || el.__data
+                            if (d) {
+                                const js = JSON.stringify(d)
+                                if (js && js.length < 300000 && js.includes(want)) hit = true
+                            }
+                        } catch (e) {}
+                        if (!hit) {
+                            const href = el.getAttribute && (el.getAttribute('href') || '')
+                            if (href && href.includes(want)) hit = true
+                        }
+                        if (!hit) continue
+                        const ownText = (el.textContent || '').trim()
+                        if (ownText === 'Subscribe' || ownText === 'Subscribed') continue
+                        const r = el.getBoundingClientRect()
+                        if (r.width > 10 && r.height > 8 && r.bottom > 0 && r.top < innerHeight && r.left < innerWidth) {
+                            const area = r.width * r.height
+                            if (area < bestArea) { bestArea = area; best = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } }
+                        }
+                    }
+                    return best
+                })()`).catch(() => null)
+                for (let hopId of hopIds.slice(0, 2)) {
+                    let pr = await playVideoCore(hopId, { record: false }).catch(() => null)
+                    attempts.push({ strategy: 'video-byline', playedVideoId: hopId, played: !!(pr && pr.ok) })
+                    if (!pr || !pr.ok) continue
+                    await pauseAnyMedia()
+                    let pt = await findBylinePoint()
+                    if (!pt) pt = await findEndpointPoint('YTLR-WATCH-PAGE')
+                    attempts.push({ strategy: 'video-byline', bylinePoint: !!pt })
+                    if (!pt) continue
+                    clickPoint(webContents, pt.x, pt.y)
+                    let r = await waitForChannelScreen(7000)
+                    if (r.matched) return { ok: true, verified: true, strategy: 'video-byline', attempts, screen: r.screen }
+                }
+            }
+        }
 
         // -- Strategy 1 (watch screens, browseId known): the watch
         // page's channel byline carries the browse endpoint — clicking
@@ -1979,6 +2077,44 @@ function createMcpServer({ getWindow, context }) {
             if (r.matched) return { ok: true, verified: true, strategy: 'navigate-event', attempts, screen: r.screen }
         }
 
+        // -- Strategy 4 (LAST RESORT -- demoted in v3.16: this SPA
+        // does not route channels by URL; kept only as a harmless
+        // final attempt. In v3.15 this ran first and sabotaged the
+        // byline strategy by destroying the watch page.)
+        // Originally Strategy 0 (Matt's rule, 2026-11-06): navigate DIRECTLY
+        // to the channel's saved URL. Search is never used to reach
+        // a channel -- result layouts differ per channel and bury
+        // entries (LTT's members shelf pushes his entry 3 rows
+        // down). The app routes by hash, so the channel path is
+        // applied as the app's route: hash first (cheap), then a
+        // full load of the app on that route (the same fallback
+        // pair play_video uses). Only the rendered-state assertion
+        // can call either a success.
+        let directUrl = target.url ||
+            (target.browseId ? `https://www.youtube.com/channel/${target.browseId}` :
+             target.handle ? `https://www.youtube.com/@${target.handle}` :
+             target.name ? `https://www.youtube.com/user/${encodeURIComponent(target.name.replace(/\s+/g, ''))}` : null)
+        if (directUrl) {
+            let directPath = ''
+            try { directPath = new URL(directUrl).pathname } catch (e) {}
+            if (directPath) {
+                if (first && first.page === 'watch') {
+                    tapKey(webContents, 'Escape')
+                    await sleep(900)
+                }
+                let chanHash = '#' + directPath
+                await pauseAnyMedia()
+                await evalJS(webContents, `location.hash = ${JSON.stringify(chanHash)}; true`).catch(() => {})
+                let r = await waitForChannelScreen(6000)
+                attempts.push({ strategy: 'direct-url-hash', url: directUrl, matched: r.matched })
+                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-hash', attempts, screen: r.screen }
+                await webContents.loadURL(`${youtubeUrl}${chanHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+                r = await waitForChannelScreen(9000)
+                attempts.push({ strategy: 'direct-url-load', url: directUrl, matched: r.matched })
+                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-load', attempts, screen: r.screen }
+            }
+        }
+
         // No search fallback: Matt's rule (2026-11-06) -- channels
         // are reached by direct URL only. If the direct route and
         // the browseId strategies above all fail, error honestly
@@ -1991,7 +2127,7 @@ function createMcpServer({ getWindow, context }) {
     }
 
     register('open_channel',
-        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation goes directly to the channel\'s saved URL first, with the app\'s browse-endpoint mechanisms as backup when a channel ID is known. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
+        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own path: the channel\'s newest upload (resolved from its RSS feed) is loaded and its byline clicked through to the channel page, with the browse-endpoint mechanisms and the saved-URL route as backups. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
         { channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL') },
         async ({ channel }) => {
             let target = resolveChannelTarget(channel)
