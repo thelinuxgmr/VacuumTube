@@ -63,6 +63,24 @@
 // (validated live 2026-11-06 against the home feed's newest
 // Asmongold TV upload).
 //
+// v3.18: the v3.17 hop failed live and hands-on probing found out
+// why -- two compounding facts. (1) playVideoCore's player-API
+// hijack leaves the PREVIOUS video's page chrome on screen: the
+// player plays the target while the title/byline belong to
+// whatever tile was clicked to reach the watch screen (seen live:
+// Asmongold's video playing under a Tiny House title). A byline
+// hop therefore needs the watch page ROUTED to the channel's own
+// video. (2) The byline itself is not a focusable/clickable
+// element and pressing select on its container toggles the
+// player UI -- but the channel AVATAR in the info bar is a real
+// button at a fixed spot (bottom-left, next to Description /
+// Subscribe). The hop is now "routed-watch": click the video's
+// own tile when it is on screen, else reload the app on the
+// watch URL (launch deep-links route videos); verify the routed
+// page is the channel's (UP x2 raises the info bar, whose
+// focused element digs to the channel's browseId); then click
+// the avatar and let the rendered-state assertion judge.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -1985,61 +2003,88 @@ function createMcpServer({ getWindow, context }) {
             return best
         })()`).catch(() => null)
 
-        // -- Strategy A (v3.16, PRIMARY): the video-byline hop.
-        // The app's own path to a channel is through one of its
-        // videos: load the channel's newest upload (its videos
-        // page -- deterministic, no search), pause it, and click the watch
-        // page's byline element, whose data carries the channel's
-        // browseId (proven live 2026-11-06: the focused byline
-        // element on Asmongold TV's video carried UCQeRaTuk...).
-        // Runs FIRST: every other navigation attempt destroys the
-        // watch page this strategy depends on.
+        // -- Strategy A (v3.18, PRIMARY): the routed-watch hop.
+        // Get the watch page ROUTED to the channel's own newest
+        // video (a player-API hijack leaves another video's title
+        // and byline on screen, so it can never work), verify the
+        // routed page belongs to this channel, then click the
+        // channel avatar in the info bar -- the one real channel
+        // button on a watch page. Search is never used.
         {
             let hopBrowseId = target.browseId || await resolveBrowseIdForTarget(target)
-            attempts.push({ strategy: 'video-byline', browseId: hopBrowseId || null })
+            attempts.push({ strategy: 'routed-watch', browseId: hopBrowseId || null })
             if (hopBrowseId) {
                 if (!target.browseId) target = { ...target, browseId: hopBrowseId }
                 let hopIds = await latestChannelVideoIds(target).catch(() => [])
-                attempts.push({ strategy: 'video-byline', videoIds: hopIds })
-                let findBylinePoint = async () => await evalJS(webContents, `(() => {
-                    const want = ${JSON.stringify(hopBrowseId)}
-                    let best = null, bestArea = Infinity
-                    for (const el of document.querySelectorAll('YTLR-WATCH-PAGE *')) {
-                        let hit = false
-                        try {
-                            const d = el.data || el.__data
-                            if (d) {
-                                const js = JSON.stringify(d)
-                                if (js && js.length < 300000 && js.includes(want)) hit = true
+                attempts.push({ strategy: 'routed-watch', videoIds: hopIds })
+                let hopVideoId = hopIds[0] || null
+                if (hopVideoId) {
+                    // Witness that the routed watch page is THIS
+                    // channel's: raise the info bar (UP x2 from the
+                    // player controls -- probed live 2026-11-06)
+                    // and read the focused element's browseId.
+                    let routedHere = async () => {
+                        tapKey(webContents, 'Up')
+                        await sleep(600)
+                        tapKey(webContents, 'Up')
+                        await sleep(1200)
+                        let snap = await screenSnapshot(webContents).catch(() => null)
+                        return !!(snap && snap.focused && snap.focused.browseId === hopBrowseId)
+                    }
+                    let routed = false
+                    // R1: the video's own tile is on screen now.
+                    let snap0 = await screenSnapshot(webContents).catch(() => null)
+                    let tile = snap0 ? (snap0.items || []).find((i) => i.videoId === hopVideoId) : null
+                    attempts.push({ strategy: 'routed-watch', tileVisible: !!tile })
+                    if (tile) {
+                        clickPoint(webContents, tile.x, tile.y)
+                        await sleep(3000)
+                        routed = await routedHere()
+                        attempts.push({ strategy: 'routed-watch', afterTileClick: routed })
+                    }
+                    // R2: reload the app on the watch URL -- launch
+                    // deep-links route videos (channels are
+                    // stripped; watch is the app's own route).
+                    if (!routed) {
+                        await evalJS(webContents, `(() => { try { location.hash = '#/watch?v=${hopVideoId}' } catch (e) {} return true })()`).catch(() => {})
+                        await evalJS(webContents, `(() => { setTimeout(() => { try { location.reload() } catch (e) {} }, 300); return true })()`).catch(() => {})
+                        await sleep(8000)
+                        routed = await routedHere()
+                        attempts.push({ strategy: 'routed-watch', afterReload: routed })
+                    }
+                    attempts.push({ strategy: 'routed-watch', routed })
+                    if (routed) {
+                        await pauseAnyMedia()
+                        // The channel avatar: a small square element
+                        // in the info bar (bottom-left, beside the
+                        // Description / Subscribe buttons). Fall back
+                        // to its fixed proportional spot.
+                        let avatar = await evalJS(webContents, `(() => {
+                            const H = innerHeight, W = innerWidth
+                            let cands = []
+                            for (const el of document.querySelectorAll('*')) {
+                                const r = el.getBoundingClientRect()
+                                if (r.width >= 24 && r.width <= 110 && r.height >= 24 && r.height <= 110 &&
+                                    Math.abs(r.width - r.height) <= 14 &&
+                                    r.top > H * 0.60 && r.top < H * 0.88 && r.left < W * 0.16) {
+                                    cands.push({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), area: r.width * r.height })
+                                }
                             }
-                        } catch (e) {}
-                        if (!hit) {
-                            const href = el.getAttribute && (el.getAttribute('href') || '')
-                            if (href && href.includes(want)) hit = true
-                        }
-                        if (!hit) continue
-                        const ownText = (el.textContent || '').trim()
-                        if (ownText === 'Subscribe' || ownText === 'Subscribed') continue
-                        const r = el.getBoundingClientRect()
-                        if (r.width > 10 && r.height > 8 && r.bottom > 0 && r.top < innerHeight && r.left < innerWidth) {
-                            const area = r.width * r.height
-                            if (area < bestArea) { bestArea = area; best = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } }
+                            cands.sort((a, b) => a.area - b.area)
+                            return cands[0] || null
+                        })()`).catch(() => null)
+                        let points = []
+                        if (avatar) points.push({ x: avatar.x, y: avatar.y, via: 'avatar-element' })
+                        points.push({ x: Math.round(1920 * 0.069), y: Math.round(1080 * 0.718), via: 'avatar-fixed' })
+                        for (const p of points) {
+                            clickPoint(webContents, p.x, p.y)
+                            attempts.push({ strategy: 'routed-watch', avatarClick: p.via, x: p.x, y: p.y })
+                            let r = await waitForChannelScreen(7000)
+                            if (r.matched) return { ok: true, verified: true, strategy: 'routed-watch', attempts, screen: r.screen }
+                            tapKey(webContents, 'Escape')
+                            await sleep(800)
                         }
                     }
-                    return best
-                })()`).catch(() => null)
-                for (let hopId of hopIds.slice(0, 2)) {
-                    let pr = await playVideoCore(hopId, { record: false }).catch(() => null)
-                    attempts.push({ strategy: 'video-byline', playedVideoId: hopId, played: !!(pr && pr.ok) })
-                    if (!pr || !pr.ok) continue
-                    await pauseAnyMedia()
-                    let pt = await findBylinePoint()
-                    if (!pt) pt = await findEndpointPoint('YTLR-WATCH-PAGE')
-                    attempts.push({ strategy: 'video-byline', bylinePoint: !!pt })
-                    if (!pt) continue
-                    clickPoint(webContents, pt.x, pt.y)
-                    let r = await waitForChannelScreen(7000)
-                    if (r.matched) return { ok: true, verified: true, strategy: 'video-byline', attempts, screen: r.screen }
                 }
             }
         }
@@ -2142,7 +2187,7 @@ function createMcpServer({ getWindow, context }) {
     }
 
     register('open_channel',
-        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own path: the channel\'s newest upload (resolved from its videos page) is loaded and its byline clicked through to the channel page, with the browse-endpoint mechanisms and the saved-URL route as backups. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
+        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own path: the channel\'s newest upload (resolved from its videos page) is opened on its own watch page and the channel avatar in the info bar is clicked through to the channel page, with the browse-endpoint mechanisms and the saved-URL route as backups. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
         { channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL') },
         async ({ channel }) => {
             let target = resolveChannelTarget(channel)
