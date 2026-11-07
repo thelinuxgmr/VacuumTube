@@ -221,6 +221,7 @@ const PROBE_JS = `(() => {
                 isLive: !!d.isLive
             }
             try { player.state = p.getPlayerState() } catch (e) {}
+            try { if (typeof p.getVolume === 'function') player.volume = p.getVolume() } catch (e) {}
         }
     } catch (e) {}
 
@@ -820,6 +821,20 @@ function createMcpServer({ getWindow, context }) {
             if (!q) return errorResult('search query is empty')
             let webContents = getWebContents()
 
+            // The search pill only exists on browse screens. If a video
+            // is in front, leave the watch screen first (Escape), or the
+            // click below finds nothing and the search silently no-ops.
+            let startProbe = await probe(webContents).catch(() => null)
+            if (startProbe && startProbe.watchView && startProbe.watchView.active) {
+                tapKey(webContents, 'Escape')
+                let escDeadline = Date.now() + 6000
+                while (Date.now() < escDeadline) {
+                    await sleep(300)
+                    let p = await probe(webContents).catch(() => null)
+                    if (p && (!p.watchView || !p.watchView.active)) break
+                }
+            }
+
             // Open the search screen by clicking the search pill/bar — a
             // real input event; the SPA ignores route changes.
             let pill = await evalJS(webContents, `(() => {
@@ -879,7 +894,7 @@ function createMcpServer({ getWindow, context }) {
                     }
                     return null
                 }
-                const els = document.querySelectorAll('YTLR-TILE-RENDERER, [class*="tile" i], [class*="result" i]')
+                const els = document.querySelectorAll('YTLR-TILE-RENDERER, [class*="tile" i], [class*="result" i], [class*="search-result" i], [data-video-id]')
                 for (const el of els) {
                     const r = el.getBoundingClientRect()
                     if (r.width < 60 || r.height < 40) continue
