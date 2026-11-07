@@ -823,17 +823,35 @@ function createMcpServer({ getWindow, context }) {
         })
 
     register('search',
-        'Open the YouTube TV search screen, type the query, and return the top results found on the page (title + video ID when the page exposes them).',
-        { query: z.string().describe('Search query') },
-        async ({ query }) => {
+        'Open the YouTube TV search screen, type the query, and return the top results (title + video ID). Results are verified to belong to this query — the search response must provably refresh after typing — and the tool errors rather than returning stale results.',
+        {
+            query: z.string().describe('Search query'),
+            openChannel: z.boolean().optional().describe('After returning verified results, also open the channel entry (@handle) shown in the results — the creator-search flow: the channel page\'s first tile is its newest video. The resulting page state is reported in openedChannel.')
+        },
+        async ({ query, openChannel }) => {
             let q = String(query || '').trim()
             if (!q) return errorResult('search query is empty')
             let webContents = getWebContents()
+
+            // If the TV is sitting on the Who's Watching profile
+            // picker, searching is meaningless: there is no search
+            // pill, typing goes into the void, and any "results" would
+            // be whatever list the page store happens to hold (all
+            // observed live after an app relaunch). Fail clearly.
+            let pickerVisible = (p) => {
+                if (!p) return false
+                const t = ((p.pageText || '') + ' ' + (p.dialog || '')).toLowerCase()
+                return t.includes('watch as guest') || t.includes('add account') ||
+                    t.includes("who's watching") || t.includes('who is watching')
+            }
 
             // The search pill only exists on browse screens. If a video
             // is in front, leave the watch screen first (Escape), or the
             // click below finds nothing and the search silently no-ops.
             let startProbe = await probe(webContents).catch(() => null)
+            if (pickerVisible(startProbe)) {
+                return errorResult('search unavailable: the TV is on the "Who\'s Watching" profile picker — select a profile on the TV first, then retry the search')
+            }
             if (startProbe && startProbe.watchView && startProbe.watchView.active) {
                 tapKey(webContents, 'Escape')
                 let escDeadline = Date.now() + 6000
@@ -898,6 +916,150 @@ function createMcpServer({ getWindow, context }) {
                 }
                 return false
             }
+            // Full search-page scan: every search-response renderer's
+            // data fingerprint + structurally parsed results, the
+            // results actually visible on screen, and the page header.
+            // Used for the pre-typing snapshot and for the post-typing
+            // verification below (v3.8) — a single scan shape for both,
+            // so "what changed" is directly comparable.
+            let scanSearch = async () => await evalJS(webContents, `(() => {
+                const fnv = (s) => {
+                    let h = 0x811c9dc5
+                    for (let i = 0; i < s.length; i++) { h ^= s.charCodeAt(i); h = Math.imul(h, 0x01000193) }
+                    return (h >>> 0).toString(16) + ':' + s.length
+                }
+                const titleText = (t) => {
+                    if (!t) return null
+                    if (typeof t.simpleText === 'string') return t.simpleText
+                    if (Array.isArray(t.runs)) return t.runs.map(r => r.text || '').join('')
+                    return null
+                }
+                const idRe = /^[\\w-]{11}$/
+                // Pair each video ID with the title from the SAME item
+                // object. (The v3.3 approach regex-zipped every videoId
+                // and every title in the whole stringified response;
+                // extra shelves in that blob scramble the pairings.)
+                const extractPairs = (data) => {
+                    const pairs = []
+                    const seen = new Set()
+                    let nodes = 0
+                    const walk = (node, depth) => {
+                        if (!node || typeof node !== 'object' || pairs.length >= 10 || depth > 14 || ++nodes > 30000) return
+                        if (Array.isArray(node)) {
+                            for (const c of node) { walk(c, depth + 1); if (pairs.length >= 10) return }
+                            return
+                        }
+                        let id = null
+                        for (const k of ['videoId', 'contentId']) {
+                            if (typeof node[k] === 'string' && idRe.test(node[k])) { id = node[k]; break }
+                        }
+                        if (id) {
+                            const t = titleText(node.title) || titleText(node.headline) ||
+                                (node.metadata ? titleText(node.metadata.title) : null)
+                            if (t) {
+                                if (!seen.has(id)) { seen.add(id); pairs.push({ id, title: t }) }
+                                return // an item object: do not descend into it
+                            }
+                        }
+                        for (const k of Object.keys(node)) { walk(node[k], depth + 1); if (pairs.length >= 10) return }
+                    }
+                    walk(data, 0)
+                    return pairs
+                }
+                // Channel entries in the same response (creator
+                // searches surface the channel itself, e.g. 'Tectone
+                // @Tectone'): an object carrying a channel/browse ID
+                // (UC…) and a title, with no video ID of its own.
+                const chanRe = /^UC[\\w-]{22}$/
+                const extractChannels = (data) => {
+                    const chans = []
+                    const seen = new Set()
+                    let nodes = 0
+                    const walk = (node, depth) => {
+                        if (!node || typeof node !== 'object' || chans.length >= 5 || depth > 14 || ++nodes > 30000) return
+                        if (Array.isArray(node)) {
+                            for (const c of node) { walk(c, depth + 1); if (chans.length >= 5) return }
+                            return
+                        }
+                        let id = null
+                        for (const k of ['channelId', 'browseId']) {
+                            if (typeof node[k] === 'string' && chanRe.test(node[k])) { id = node[k]; break }
+                        }
+                        if (id && !node.videoId) {
+                            const t = titleText(node.title) || (node.metadata ? titleText(node.metadata.title) : null)
+                            if (t) {
+                                if (!seen.has(id)) { seen.add(id); chans.push({ id, title: t }) }
+                                return
+                            }
+                        }
+                        for (const k of Object.keys(node)) { walk(node[k], depth + 1); if (chans.length >= 5) return }
+                    }
+                    walk(data, 0)
+                    return chans
+                }
+                const renderers = []
+                for (const el of document.querySelectorAll('YTLR-SEARCH-RESPONSE-RENDERER')) {
+                    if (!el.data) { renderers.push({ fp: null, pairs: [], channels: [] }); continue }
+                    let s = ''
+                    try { s = JSON.stringify(el.data) } catch (e) {}
+                    renderers.push({
+                        fp: s ? fnv(s) : null,
+                        pairs: s ? extractPairs(el.data) : [],
+                        channels: s ? extractChannels(el.data) : []
+                    })
+                }
+                // What is actually on screen (the v3.2 rendered scrape):
+                // visible result titles, plus per-item IDs dug from each
+                // rendered item's own data subtree (local to the item,
+                // so they cannot scramble across items).
+                const visibleTitles = []
+                const lockupPairs = []
+                const digId = (el) => {
+                    let node = el
+                    for (let i = 0; i < 3 && node; i++) {
+                        try {
+                            const d = node.data || node.__data
+                            if (d) {
+                                const m = JSON.stringify(d).slice(0, 12000).match(/"videoId":\\s*"([\\w-]{11})"/)
+                                if (m) return m[1]
+                            }
+                        } catch (e) {}
+                        node = node.parentElement
+                    }
+                    return null
+                }
+                let items = []
+                for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
+                    items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                }
+                if (items.length === 0) items = Array.from(document.querySelectorAll('YTLR-TILE-RENDERER'))
+                const seenL = new Set()
+                const visibleChannels = []
+                for (const el of items) {
+                    const r = el.getBoundingClientRect()
+                    if (r.width < 40 || r.height < 20) continue
+                    const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                    if (!text) continue
+                    const title = (text.split(/(?=\\d+:\\d{2})|(?=LIVE)/)[0] || text).slice(0, 160)
+                    if (visibleTitles.length < 5) visibleTitles.push(title)
+                    const id = digId(el)
+                    if (id && !seenL.has(id) && lockupPairs.length < 10) {
+                        seenL.add(id)
+                        lockupPairs.push({ id, title })
+                    }
+                    // A rendered entry with an @handle and no video ID
+                    // is a channel entry in the results list.
+                    if (!id && /@[\\w.]+/.test(text) && visibleChannels.length < 5) {
+                        visibleChannels.push({ title })
+                    }
+                }
+                const bt = (document.body.innerText || '').replace(/\\s+/g, ' ')
+                const hi = bt.toLowerCase().indexOf('search results for ')
+                const header = hi < 0 ? null : bt.slice(hi + 19, hi + 80).trim().toLowerCase()
+                return { renderers, visibleTitles, lockupPairs, visibleChannels, header }
+            })()`).catch(() => null)
+            let searchSnapshot = null
+
             // Own the search box: if the user (or an earlier search)
             // left text in it, clear it with the keyboard's CLEAR key
             // and verify the box is empty before typing — otherwise the
@@ -920,6 +1082,12 @@ function createMcpServer({ getWindow, context }) {
                     await sleep(500)
                     existingQuery = await readBox()
                 }
+                // Snapshot the cleared search page BEFORE typing. The
+                // acceptance logic below requires the results to
+                // provably change against this snapshot in response to
+                // this query — that binding is what the pre-v3.8 logic
+                // lacked (it trusted the header alone).
+                searchSnapshot = await scanSearch()
             }
 
             let typed = ''
@@ -949,76 +1117,192 @@ function createMcpServer({ getWindow, context }) {
                 }
             }
 
-            // Wait for and scrape the results. The rendered items are
-            // virtualized rows without usable per-item data, but the
-            // search response renderer's data object carries the full
-            // result set: video IDs and titles appear in result order
-            // (verified live — first ID matches first title). Zip them.
-            let scrape = async () => await evalJS(webContents, `(() => {
-                const el = document.querySelector('YTLR-SEARCH-RESPONSE-RENDERER')
-                if (!el || !el.data) return []
-                const s = JSON.stringify(el.data)
-                const ids = []
-                const seen = new Set()
-                for (const m of s.matchAll(/"videoId":\\s*"([\\w-]{11})"/g)) {
-                    if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]) }
-                }
-                const titles = []
-                for (const m of s.matchAll(/"title":\\{"simpleText":"((?:[^"\\\\]|\\\\.)*)"/g)) {
-                    try { titles.push(JSON.parse('"' + m[1] + '"')) } catch (e) { titles.push(m[1]) }
-                }
-                const out = []
-                for (let i = 0; i < Math.min(10, ids.length); i++) {
-                    out.push({ id: ids[i], title: titles[i] || null })
-                }
-                return out
-            })()`).catch(() => [])
+            // Submit the search with the keyboard's SEARCH key.
+            // Typing alone only fills the box and lists suggestions —
+            // per Matt's live report the search must actually be
+            // executed. Submitting also issues the definitive search
+            // response for exactly this query, which the verification
+            // below binds the returned results to.
+            let submitted = false
+            if (onSearch && typed) {
+                submitted = await typeLabel('SEARCH')
+                if (submitted) await sleep(900)
+            }
 
-            // The previous search's response data lingers in the page
-            // while a new query loads, so results alone aren't proof
-            // they're for THIS query — also require the page's
-            // "Search results for <query>" header to match what was
-            // typed before accepting them.
-            let results = []
-            let resultsForQuery = false
-            let rDeadline = Date.now() + 12000
-            let headerCheck = async () => await evalJS(webContents, `(() => {
-                const t = (document.body.innerText || '').replace(/\\s+/g, ' ')
-                const i = t.toLowerCase().indexOf('search results for ')
-                if (i < 0) return null
-                return t.slice(i + 19, i + 80).trim().toLowerCase()
-            })()`).catch(() => null)
-            for (;;) {
-                results = await scrape()
-                if (results.length > 0) {
-                    let header = await headerCheck()
-                    let want = typed.trim().toLowerCase()
-                    if (!want || (header && header.startsWith(want.slice(0, 24)))) {
-                        resultsForQuery = true
-                        break
-                    }
-                }
-                if (Date.now() >= rDeadline) break
-                await sleep(700)
+            // Wait for the results — and VERIFY they belong to this
+            // query (v3.8). The pre-v3.8 logic accepted the first
+            // non-empty scrape once the "Search results for <query>"
+            // header matched, but the header follows the search box,
+            // not the response — and the scrape read the first
+            // response renderer in the document and regex-zipped its
+            // whole data blob. Live use returned a frozen list of
+            // home-feed items, byte-identical across different
+            // queries, with resultsForQuery=true. Acceptance now
+            // requires ALL of:
+            //   - the page header matches what was typed;
+            //   - a candidate that is PROVABLY fresh for this call:
+            //     a response renderer's data fingerprint changed vs
+            //     the pre-typing snapshot; or the on-screen results
+            //     changed and agree with the candidate's titles; or
+            //     the rendered result items themselves (IDs and
+            //     titles read per item, on screen);
+            //   - the candidate is stable across two consecutive
+            //     polls (typing/submitting produces intermediate
+            //     states; the submitted response is the last one).
+            // If nothing verifies before the deadline, the tool
+            // errors honestly instead of returning wrong results.
+            const normTitle = (s) => String(s || '').replace(/\s+/g, ' ').trim().toLowerCase()
+            const titleMatch = (a, b) => {
+                a = normTitle(a); b = normTitle(b)
+                if (!a || !b) return false
+                return a.startsWith(b.slice(0, 24)) || b.startsWith(a.slice(0, 24))
+            }
+            // null = on-screen list unreadable (gate skipped).
+            // Otherwise the first visible title must match and at
+            // least half of the compared positions must agree.
+            const agreeWithVisible = (pairs, visible) => {
+                if (!visible || visible.length === 0) return null
+                let n = Math.min(3, pairs.length, visible.length)
+                if (n === 0) return false
+                if (!titleMatch(pairs[0].title, visible[0])) return false
+                let ok = 0
+                for (let i = 0; i < n; i++) if (titleMatch(pairs[i].title, visible[i])) ok++
+                return ok >= Math.ceil(n / 2)
             }
 
             let p = await probe(webContents).catch(() => null)
+            if (!onSearch) {
+                if (pickerVisible(p)) {
+                    return errorResult('search unavailable: the TV is on the "Who\'s Watching" profile picker — select a profile on the TV first, then retry the search')
+                }
+                return errorResult('the search screen did not open, so the query was not typed. Page state: ' + JSON.stringify(p ? stateFromProbe(webContents, p) : {}))
+            }
+            if (!typed) {
+                return errorResult('the query "' + q + '" could not be typed — no on-screen keyboard keys were clickable, so no search was executed')
+            }
+
+            let results = []
+            let channels = []
+            let resultsForQuery = false
+            let resultsFresh = null
+            let lastScan = null
+            let lastKey = null
+            let stablePolls = 0
+            let rDeadline = Date.now() + 15000
+            let want = typed.trim().toLowerCase()
+            while (Date.now() < rDeadline) {
+                let scan = await scanSearch()
+                if (scan) {
+                    lastScan = scan
+                    let candidate = null
+                    if (scan.header && scan.header.startsWith(want.slice(0, 24))) {
+                        let snapFps = searchSnapshot ? searchSnapshot.renderers.map(r => r.fp) : []
+                        let snapVisible = searchSnapshot ? JSON.stringify(searchSnapshot.visibleTitles) : null
+                        let visibleChanged = scan.visibleTitles.length > 0 &&
+                            JSON.stringify(scan.visibleTitles) !== snapVisible
+                        for (let i = 0; i < scan.renderers.length; i++) {
+                            let r = scan.renderers[i]
+                            if (!r.pairs.length) continue
+                            let agree = agreeWithVisible(r.pairs, scan.visibleTitles)
+                            if (agree === false) continue
+                            let fresh = i >= snapFps.length || snapFps[i] !== r.fp
+                            if (fresh) {
+                                candidate = { pairs: r.pairs, channels: r.channels || [], via: true, key: 'R' + i + ':' + r.fp }
+                                break
+                            }
+                            if (!candidate && visibleChanged && agree === true) {
+                                candidate = { pairs: r.pairs, channels: r.channels || [], via: 'visible-verified', key: 'V' + i + ':' + r.fp }
+                            }
+                        }
+                        if (!candidate && visibleChanged && scan.lockupPairs.length > 0) {
+                            candidate = {
+                                pairs: scan.lockupPairs, channels: [], via: 'rendered',
+                                key: 'L:' + scan.lockupPairs.map(x => x.id).join(',')
+                            }
+                        }
+                    }
+                    if (candidate) {
+                        if (candidate.key === lastKey) stablePolls++
+                        else { lastKey = candidate.key; stablePolls = 1 }
+                        if (stablePolls >= 2) {
+                            results = candidate.pairs
+                            channels = candidate.channels
+                            if (channels.length === 0 && lastScan.visibleChannels && lastScan.visibleChannels.length > 0) {
+                                channels = lastScan.visibleChannels
+                            }
+                            resultsForQuery = true
+                            resultsFresh = candidate.via
+                            break
+                        }
+                    } else {
+                        lastKey = null
+                        stablePolls = 0
+                    }
+                }
+                await sleep(700)
+            }
+
+            p = await probe(webContents).catch(() => null)
+            if (!resultsForQuery) {
+                let diag = {
+                    query: q,
+                    typedQuery: typed,
+                    submitted,
+                    headerSeen: lastScan ? lastScan.header : null,
+                    renderersSeen: lastScan ? lastScan.renderers.length : 0,
+                    rendererPairs: lastScan ? lastScan.renderers.map(r => r.pairs.length) : [],
+                    visibleTitles: lastScan ? lastScan.visibleTitles : [],
+                    ...(p ? stateFromProbe(webContents, p) : {})
+                }
+                return errorResult('search could not verify that the on-page results belong to "' + q + '" — the search response did not provably refresh for this query, so no results are returned rather than possibly-stale ones. Diagnostics: ' + JSON.stringify(diag))
+            }
+
             let out = {
                 ok: true,
                 query: q,
                 typedQuery: typed,
+                submitted,
                 clearedExistingQuery: (typeof foundQuery !== 'undefined' && foundQuery) ? foundQuery : null,
                 boxEmptyBeforeTyping: existingQuery === '',
                 onSearchScreen: onSearch,
                 resultsForQuery,
+                resultsFresh,
                 results,
+                channels,
                 ...(p ? stateFromProbe(webContents, p) : {})
             }
             if (skipped) out.skippedCharacters = skipped
-            if (results.length === 0) {
-                out.note = 'no results could be scraped from the search page (see pageText for what the TV is showing)'
-            } else if (!resultsForQuery) {
-                out.note = 'results may be stale — the page header never confirmed they belong to this query'
+
+            // Optional: open the channel entry from the results
+            // (Matt's creator-search flow: select the channel, land
+            // on its page — the newest video is its first tile). One
+            // trusted click on the rendered channel lockup, the same
+            // primitive as the search-pill click; the resulting page
+            // state is reported back for the caller to act on.
+            if (openChannel) {
+                let pt = await evalJS(webContents, `(() => {
+                    let items = []
+                    for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
+                        items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                    }
+                    for (const el of items) {
+                        const r = el.getBoundingClientRect()
+                        if (r.width < 40 || r.height < 20) continue
+                        const text = (el.innerText || '').replace(/\\s+/g, ' ')
+                        if (/@[\\w.]+/.test(text)) {
+                            return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: text.slice(0, 120) }
+                        }
+                    }
+                    return null
+                })()`).catch(() => null)
+                if (pt) {
+                    clickPoint(webContents, pt.x, pt.y)
+                    await sleep(2500)
+                    let p2 = await probe(webContents).catch(() => null)
+                    out.openedChannel = { clicked: pt.text, ...(p2 ? stateFromProbe(webContents, p2) : {}) }
+                } else {
+                    out.openedChannel = { clicked: null, note: 'no channel entry (@handle) was visible in the rendered results' }
+                }
             }
             return textResult(out)
         })

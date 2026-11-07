@@ -52,7 +52,7 @@ code changes. To revoke an agent, remove its token and restart.
 | `seek` | `seconds`: number | Seeks to an absolute position |
 | `set_volume` | `volume`: 0–100 | Sets playback volume |
 | `navigate_home` | — | Back to the YouTube TV home screen (real Escape key) |
-| `search` | `query`: string | Opens the TV search screen, **clears any text already in the search box**, types the query on the on-screen keyboard, and returns the top 10 results (title + video ID) from the search response data |
+| `search` | `query`: string, `openChannel`: optional boolean | Opens the TV search screen, **clears any text already in the search box**, types the query on the on-screen keyboard, **submits it with the SEARCH key**, and returns the top 10 results (title + video ID) — but only once they are verified to belong to this query (see below). Channel entries in the results are returned separately in `channels`; with `openChannel: true` the tool also clicks the rendered channel entry and reports the page state it lands on |
 | `back` | `steps`: optional, 1–10 | Returns to a previously watched video (see History) |
 
 ## How control works (learned live — read this before "fixing" navigation)
@@ -96,12 +96,33 @@ keyboard's keys. Letters, SPACE, CLEAR and SEARCH live in the
 `YTLR-SEARCH-KEYBOARD` subtree; digits hide behind the `&123` mode key.
 The tool first reads the search box and CLEARs any pre-existing text
 (reported as `clearedExistingQuery`), so a user's half-typed query is
-replaced, never appended to. Results are read from
-`YTLR-SEARCH-RESPONSE-RENDERER.data`, whose video IDs and titles appear
-in matching order, and are only accepted once the page's
-"Search results for <query>" header matches what was typed
-(`resultsForQuery`) — the previous query's data otherwise lingers and
-would be returned stale.
+replaced, never appended to. After typing it presses the SEARCH key —
+typing alone only lists suggestions; the search must actually be
+executed. If the TV is on the Who's Watching profile picker, the tool
+errors immediately (there is nothing to type into).
+
+**Result verification (v3.8 — read this before "simplifying" it).** An
+earlier version read the first `YTLR-SEARCH-RESPONSE-RENDERER` in the
+document, regex-zipped every `videoId` and every title in its whole
+data blob, and accepted the result once the "Search results for
+<query>" header matched. In live use that returned a **frozen list of
+home-feed items, byte-identical across different queries**, with
+`resultsForQuery: true`: the header follows the search *box*, not the
+response, the first renderer in the document is not necessarily the
+live one, and whole-blob zipping pairs IDs with titles from other
+shelves. The tool now snapshots every response renderer's data
+fingerprint before typing, and accepts results only when **all** of
+these hold: the header matches the typed query; a candidate is
+provably fresh for this call (a renderer's fingerprint changed vs the
+snapshot — or the on-screen results changed and their titles agree
+with the candidate's — or the results are read from the rendered
+items themselves, per item); and the candidate is stable across two
+polls. IDs and titles are extracted by walking the response object
+and pairing each ID with the title of the *same* item object. If
+nothing verifies in time, the tool returns an error with diagnostics
+instead of plausible-looking wrong results. `resultsFresh` in the
+output says which path verified (`true`, `"visible-verified"`, or
+`"rendered"`).
 
 `get_state` probes **all** `<video>` elements and reports the active one
 (largest/loaded/playing), plus the watch-screen rect (`watchView.active`
