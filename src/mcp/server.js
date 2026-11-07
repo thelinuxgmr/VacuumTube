@@ -105,6 +105,17 @@
 // between clicks -- the URL witness re-verifies the watch page
 // before each subsequent click.
 //
+// v3.21: v3.20's log shows cand-0 at (264,1575) -- the avatar's
+// exact spot -- clicked with no landing. The likely cause: the
+// info bar auto-fades after a few idle seconds and the synthetic
+// UP keys may not wake it, so the clicks landed on the bare
+// video surface (the measured rects persist even when the bar
+// is faded). The avatar phase now WAKES the UI first (a mouse
+// move to the avatar's spot, a beat, then re-measure), requires
+// candidates to be actually visible (opacity/visibility chain),
+// and gives every click a move-then-click gap so the bar is up
+// when the click lands.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -2105,21 +2116,31 @@ function createMcpServer({ getWindow, context }) {
                         // the info bar (bottom-left, beside the
                         // Description / Subscribe buttons), at a
                         // known proportional spot (0.069W, 0.718H --
-                        // screenshot-measured). Rank square
-                        // candidates by distance to that spot; the
-                        // UI runs at 3840x2160 CSS px, so sizes and
-                        // the fixed point scale with the real
-                        // viewport. NO Escape between clicks: on a
-                        // watch page Escape backs out to home.
-                        let avatarInfo = await evalJS(webContents, `(() => {
+                        // screenshot-measured). The bar auto-fades,
+                        // so: wake the UI with a mouse move to the
+                        // avatar's spot, THEN measure (candidates
+                        // must be actually visible -- opacity and
+                        // visibility chain), then click with a
+                        // move-then-click gap. NO Escape between
+                        // clicks: on a watch page it backs out home.
+                        let findAvatarPoints = async () => await evalJS(webContents, `(() => {
                             const H = innerHeight, W = innerWidth
                             const tx = W * 0.069, ty = H * 0.718
+                            const visChain = (el) => {
+                                let n = el
+                                for (let i = 0; i < 5 && n; i++) {
+                                    const cs = getComputedStyle(n)
+                                    if (cs.visibility === 'hidden' || parseFloat(cs.opacity || '1') < 0.05) return false
+                                    n = n.parentElement
+                                }
+                                return true
+                            }
                             let cands = []
                             for (const el of document.querySelectorAll('*')) {
                                 const r = el.getBoundingClientRect()
                                 if (r.width >= 20 && r.width <= 230 && r.height >= 20 && r.height <= 230 &&
                                     Math.abs(r.width - r.height) <= 20 &&
-                                    r.top > H * 0.55 && r.top < H * 0.90 && r.left < W * 0.22) {
+                                    r.top > H * 0.55 && r.top < H * 0.90 && r.left < W * 0.22 && visChain(el)) {
                                     const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2)
                                     cands.push({ x: cx, y: cy, d: Math.round(Math.hypot(cx - tx, cy - ty)) })
                                 }
@@ -2128,26 +2149,46 @@ function createMcpServer({ getWindow, context }) {
                             let out = []
                             for (const c of cands) {
                                 if (out.every((o) => Math.hypot(o.x - c.x, o.y - c.y) > 24)) out.push(c)
-                                if (out.length >= 4) break
+                                if (out.length >= 3) break
                             }
-                            return { cands: out, fx: Math.round(tx), fy: Math.round(ty), W, H }
+                            out.push({ x: Math.round(tx), y: Math.round(ty), fixed: true })
+                            return out
                         })()`).catch(() => null)
-                        let points = []
-                        if (avatarInfo && avatarInfo.cands) {
-                            avatarInfo.cands.forEach((c, i) => points.push({ x: c.x, y: c.y, via: 'avatar-cand-' + i }))
+                        let wakeClick = async (x, y) => {
+                            focusWindow()
+                            webContents.sendInputEvent({ type: 'mouseMove', x, y })
+                            await sleep(700)
+                            webContents.sendInputEvent({ type: 'mouseDown', x, y, button: 'left', clickCount: 1 })
+                            webContents.sendInputEvent({ type: 'mouseUp', x, y, button: 'left', clickCount: 1 })
                         }
-                        if (avatarInfo) points.push({ x: avatarInfo.fx, y: avatarInfo.fy, via: 'avatar-fixed' })
-                        attempts.push({ strategy: 'routed-watch', avatarCandidates: points.length, viewport: avatarInfo ? (avatarInfo.W + 'x' + avatarInfo.H) : null })
-                        for (const p of points) {
+                        // Wake the watch UI at the avatar's spot.
+                        {
+                            let st = await evalJS(webContents, '({ w: innerWidth, h: innerHeight })').catch(() => null)
+                            if (st) {
+                                focusWindow()
+                                webContents.sendInputEvent({ type: 'mouseMove', x: Math.round(st.w * 0.069), y: Math.round(st.h * 0.718) })
+                                await sleep(900)
+                            }
+                        }
+                        let points = await findAvatarPoints()
+                        attempts.push({ strategy: 'routed-watch', avatarCandidates: points ? points.length : 0 })
+                        for (const p of (points || [])) {
                             if (!String(await hrefNow()).includes('#/watch?v=' + hopVideoId)) {
                                 attempts.push({ strategy: 'routed-watch', avatarAbort: 'left-watch-page' })
                                 break
                             }
-                            clickPoint(webContents, p.x, p.y)
-                            attempts.push({ strategy: 'routed-watch', avatarClick: p.via, x: p.x, y: p.y })
+                            await wakeClick(p.x, p.y)
+                            attempts.push({ strategy: 'routed-watch', avatarClick: p.fixed ? 'avatar-fixed' : 'avatar-cand', x: p.x, y: p.y })
                             let r = await waitForChannelScreen(6000)
                             if (r.matched) return { ok: true, verified: true, strategy: 'routed-watch', attempts, screen: r.screen }
                             await sleep(600)
+                            // Re-measure for the next attempt: a
+                            // click may have woken or moved the bar.
+                            let fresh = await findAvatarPoints()
+                            if (fresh && fresh.length) {
+                                let cur = points.indexOf(p)
+                                points = points.slice(0, cur + 1).concat(fresh.filter((f) => !points.slice(0, cur + 1).some((q) => Math.hypot(q.x - f.x, q.y - f.y) <= 24)))
+                            }
                         }
                     }
                 }
