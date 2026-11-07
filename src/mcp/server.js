@@ -92,6 +92,19 @@
 // the info bar is raised before the avatar clicks, whose loop
 // also retries the element point after the wake-up click.
 //
+// v3.20: v3.19 ROUTED correctly (href proved #/watch?v=<target>
+// after the tile click) -- the avatar clicks missed. Three bugs:
+// the app UI runs at 3840x2160 CSS px, so the hardcoded 1080p
+// fixed point clicked the wrong quadrant; the finder's 110px
+// size cap excluded the real avatar at 4K scale and picked a
+// smaller square nearby; and the Escape pressed between clicks
+// BACKED OUT of the watch page to home, so later clicks landed
+// on the home feed. Finder is now distance-ranked to the
+// avatar's known spot (fractions of the real viewport), the
+// fixed point uses the real inner size, and there is no Escape
+// between clicks -- the URL witness re-verifies the watch page
+// before each subsequent click.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -2088,35 +2101,53 @@ function createMcpServer({ getWindow, context }) {
                         await sleep(500)
                         tapKey(webContents, 'Up')
                         await sleep(1000)
-                        // The channel avatar: a small square element
-                        // in the info bar (bottom-left, beside the
-                        // Description / Subscribe buttons). Fall back
-                        // to its fixed proportional spot.
-                        let avatar = await evalJS(webContents, `(() => {
+                        // The channel avatar: a square element in
+                        // the info bar (bottom-left, beside the
+                        // Description / Subscribe buttons), at a
+                        // known proportional spot (0.069W, 0.718H --
+                        // screenshot-measured). Rank square
+                        // candidates by distance to that spot; the
+                        // UI runs at 3840x2160 CSS px, so sizes and
+                        // the fixed point scale with the real
+                        // viewport. NO Escape between clicks: on a
+                        // watch page Escape backs out to home.
+                        let avatarInfo = await evalJS(webContents, `(() => {
                             const H = innerHeight, W = innerWidth
+                            const tx = W * 0.069, ty = H * 0.718
                             let cands = []
                             for (const el of document.querySelectorAll('*')) {
                                 const r = el.getBoundingClientRect()
-                                if (r.width >= 24 && r.width <= 110 && r.height >= 24 && r.height <= 110 &&
-                                    Math.abs(r.width - r.height) <= 14 &&
-                                    r.top > H * 0.60 && r.top < H * 0.88 && r.left < W * 0.16) {
-                                    cands.push({ x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), area: r.width * r.height })
+                                if (r.width >= 20 && r.width <= 230 && r.height >= 20 && r.height <= 230 &&
+                                    Math.abs(r.width - r.height) <= 20 &&
+                                    r.top > H * 0.55 && r.top < H * 0.90 && r.left < W * 0.22) {
+                                    const cx = Math.round(r.x + r.width / 2), cy = Math.round(r.y + r.height / 2)
+                                    cands.push({ x: cx, y: cy, d: Math.round(Math.hypot(cx - tx, cy - ty)) })
                                 }
                             }
-                            cands.sort((a, b) => a.area - b.area)
-                            return cands[0] || null
+                            cands.sort((a, b) => a.d - b.d)
+                            let out = []
+                            for (const c of cands) {
+                                if (out.every((o) => Math.hypot(o.x - c.x, o.y - c.y) > 24)) out.push(c)
+                                if (out.length >= 4) break
+                            }
+                            return { cands: out, fx: Math.round(tx), fy: Math.round(ty), W, H }
                         })()`).catch(() => null)
                         let points = []
-                        if (avatar) points.push({ x: avatar.x, y: avatar.y, via: 'avatar-element' })
-                        points.push({ x: Math.round(1920 * 0.069), y: Math.round(1080 * 0.718), via: 'avatar-fixed' })
-                        if (avatar) points.push({ x: avatar.x, y: avatar.y, via: 'avatar-element-retry' })
+                        if (avatarInfo && avatarInfo.cands) {
+                            avatarInfo.cands.forEach((c, i) => points.push({ x: c.x, y: c.y, via: 'avatar-cand-' + i }))
+                        }
+                        if (avatarInfo) points.push({ x: avatarInfo.fx, y: avatarInfo.fy, via: 'avatar-fixed' })
+                        attempts.push({ strategy: 'routed-watch', avatarCandidates: points.length, viewport: avatarInfo ? (avatarInfo.W + 'x' + avatarInfo.H) : null })
                         for (const p of points) {
+                            if (!String(await hrefNow()).includes('#/watch?v=' + hopVideoId)) {
+                                attempts.push({ strategy: 'routed-watch', avatarAbort: 'left-watch-page' })
+                                break
+                            }
                             clickPoint(webContents, p.x, p.y)
                             attempts.push({ strategy: 'routed-watch', avatarClick: p.via, x: p.x, y: p.y })
-                            let r = await waitForChannelScreen(7000)
+                            let r = await waitForChannelScreen(6000)
                             if (r.matched) return { ok: true, verified: true, strategy: 'routed-watch', attempts, screen: r.screen }
-                            tapKey(webContents, 'Escape')
-                            await sleep(800)
+                            await sleep(600)
                         }
                     }
                 }
