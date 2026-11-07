@@ -893,6 +893,21 @@ function createMcpServer({ getWindow, context }) {
                     if (p && (!p.watchView || !p.watchView.active)) break
                 }
             }
+            // Repeat-search reset: if the app is ALREADY on the search
+            // screen showing a previous query's results, typing into
+            // that layered view proved unreliable live (v3.9/v3.10
+            // acceptance: follow-up searches typed and "submitted" but
+            // the response never refreshed — the renderer and header
+            // stayed on the previous query). Escape back to a browse
+            // screen and re-enter search fresh, every call.
+            if (startProbe && (startProbe.hash || '').startsWith('#/search')) {
+                for (let i = 0; i < 2; i++) {
+                    tapKey(webContents, 'Escape')
+                    await sleep(800)
+                    let p = await probe(webContents).catch(() => null)
+                    if (!p || !(p.hash || '').startsWith('#/search')) break
+                }
+            }
 
             // Open the search screen by clicking the search pill/bar — a
             // real input event; the SPA ignores route changes.
@@ -964,6 +979,11 @@ function createMcpServer({ getWindow, context }) {
                     if (!t) return null
                     if (typeof t.simpleText === 'string') return t.simpleText
                     if (Array.isArray(t.runs)) return t.runs.map(r => r.text || '').join('')
+                    // LockupViewModel titles are { content: "..." } —
+                    // no simpleText/runs. Missing this made pairing
+                    // return zero on the real response (live diag:
+                    // contentType LOCKUP_CONTENT_TYPE_VIDEO).
+                    if (typeof t.content === 'string' && t.content) return t.content
                     return null
                 }
                 const idRe = /^[\\w-]{11}$/
@@ -1039,6 +1059,12 @@ function createMcpServer({ getWindow, context }) {
                         for (const k of ['channelId', 'browseId']) {
                             if (typeof node[k] === 'string' && chanRe.test(node[k])) { id = node[k]; break }
                         }
+                        // Lockup channel entries carry the UC id as
+                        // contentId with a CHANNEL contentType instead.
+                        if (!id && typeof node.contentId === 'string' && chanRe.test(node.contentId) &&
+                            typeof node.contentType === 'string' && node.contentType.includes('CHANNEL')) {
+                            id = node.contentId
+                        }
                         if (id && !node.videoId) {
                             const t = findTitle(node, 0)
                             if (t) {
@@ -1095,7 +1121,15 @@ function createMcpServer({ getWindow, context }) {
                     const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
                     if (!text) continue
                     const title = (text.split(/(?=\\d+:\\d{2})|(?=LIVE)/)[0] || text).slice(0, 160)
-                    if (visibleTitles.length < 5) visibleTitles.push(title)
+                    // Containers masquerading as items leak the page
+                    // header ("Search results for …") and huge text
+                    // blobs into the visible list, which then vetoed
+                    // good candidates. Real tiles are short and never
+                    // start with the header text.
+                    if (visibleTitles.length < 5 && text.length <= 400 &&
+                        !title.toLowerCase().startsWith('search results for')) {
+                        visibleTitles.push(title)
+                    }
                     const id = digId(el)
                     if (id && !seenL.has(id) && lockupPairs.length < 10) {
                         seenL.add(id)
@@ -1295,6 +1329,7 @@ function createMcpServer({ getWindow, context }) {
             let stablePolls = 0
             let rDeadline = Date.now() + 15000
             let want = typed.trim().toLowerCase()
+            let nudged = false
             while (Date.now() < rDeadline) {
                 let scan = await scanSearch()
                 if (scan) {
@@ -1343,6 +1378,16 @@ function createMcpServer({ getWindow, context }) {
                         lastKey = null
                         stablePolls = 0
                     }
+                }
+                if (!nudged && Date.now() > rDeadline - 10000) {
+                    // ~5s in with nothing verified: the submit may not
+                    // have executed in a reopened-keyboard view (live
+                    // v3.10 finding). Re-submit once — Enter plus the
+                    // SEARCH key; idempotent for the same query.
+                    nudged = true
+                    tapKey(webContents, 'Enter')
+                    await typeLabel('SEARCH')
+                    await sleep(900)
                 }
                 await sleep(700)
             }
