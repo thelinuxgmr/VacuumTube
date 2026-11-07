@@ -899,7 +899,9 @@ function createMcpServer({ getWindow, context }) {
             if (onSearch) {
                 let readBox = async () => await evalJS(webContents, `(() => {
                     const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
-                    return box ? (box.innerText || '').replace(/\\s+/g, ' ').trim() : ''
+                    if (!box) return ''
+                    const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
+                    return (t === 'Search') ? '' : t // 'Search' is the empty-box placeholder
                 })()`).catch(() => '')
                 existingQuery = await readBox()
                 var foundQuery = existingQuery
