@@ -1379,13 +1379,16 @@ function createMcpServer({ getWindow, context }) {
                         stablePolls = 0
                     }
                 }
-                if (!nudged && Date.now() > rDeadline - 10000) {
-                    // ~5s in with nothing verified: the submit may not
+                if (!nudged && Date.now() > rDeadline - 6000) {
+                    // ~9s in with nothing verified: the submit may not
                     // have executed in a reopened-keyboard view (live
-                    // v3.10 finding). Re-submit once — Enter plus the
-                    // SEARCH key; idempotent for the same query.
+                    // v3.10 finding). Re-submit once via the SEARCH key
+                    // only — idempotent for the same query. NEVER an
+                    // Enter key here: in this UI Enter ACTIVATES the
+                    // focused result (v3.11 acceptance: the nudge's
+                    // Enter opened the Tectone channel entry, then a
+                    // Taiwan video, derailing both searches).
                     nudged = true
-                    tapKey(webContents, 'Enter')
                     await typeLabel('SEARCH')
                     await sleep(900)
                 }
