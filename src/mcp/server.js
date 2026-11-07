@@ -35,6 +35,15 @@
 // play_video combines both and verifies the result against the page
 // (player video id + real duration + media source) before returning.
 //
+// Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
+// exposed as get_screen) captures what is ACTUALLY rendered — page
+// type, focused element, and visible items with their targets — and
+// navigation/search verification asserts against that rendered state.
+// Route strings and internal flags are never accepted as success
+// evidence: open_channel v1 set location.hash itself and then
+// "verified" against that same hash while the screen never changed
+// (live, 2026-11-06, three times).
+//
 // - Watch history is kept in `mcp-history.json` in userData: the videos
 //   that were played (id, title when the page exposes it, and when
 //   playback started), newest last. It powers the back() tool and is
@@ -164,6 +173,59 @@ function channelTargetFrom(input) {
     if (/\s/.test(str)) return { browseId: null, handle: null, name: str }
     if (/^[\w.-]+$/.test(str)) return { browseId: null, handle: str, name: null }
     return { browseId: null, handle: null, name: str }
+}
+
+// Parse a rendered duration label ("12:34", "1:59:58") into seconds.
+function parseDurationText(text) {
+    if (!text) return null
+    let m = String(text).trim().match(/^(\d{1,3}):(\d{2})(?::(\d{2}))?$/)
+    if (!m) return null
+    if (m[3] !== undefined) return parseInt(m[1], 10) * 3600 + parseInt(m[2], 10) * 60 + parseInt(m[3], 10)
+    return parseInt(m[1], 10) * 60 + parseInt(m[2], 10)
+}
+
+// The creator table from CREATORS.md, baked in so name → channel
+// resolution is instant and unambiguous (2026-11-06: the "Asmongold"
+// Matt asks for is Asmongold TV, @AsmonTV — the channel actually named
+// "Asmongold" is dormant and @AsmongoldTV does not exist). CREATORS.md
+// stays the human source of truth; update both together. browseId is
+// null where the UC… id has not been recorded yet — resolution then
+// goes by handle/name, which open_channel handles.
+const CREATORS = [
+    { name: 'Asmongold TV', handle: 'AsmonTV', browseId: null, aliases: ['asmongold', 'asmon', 'asmongold tv', 'admin gold', 'as gold', 'aspen gold'] },
+    { name: 'Linus Tech Tips', handle: 'LinusTechTips', browseId: null, aliases: ['linus tech tips', 'linus', 'ltt', 'minus tech tips'] },
+    { name: 'Tectone', handle: 'Tectone', browseId: null, aliases: ['tectone'] },
+    { name: 'decoy', handle: 'decoy', browseId: null, aliases: ['decoy', 'decoy voice', 'decoyvoice'] }
+]
+
+// Resolve any channel reference (creator name, dictation alias,
+// handle, channel URL, UC… id) to a navigation target, preferring the
+// creator table above.
+function resolveChannelTarget(input) {
+    let raw = String(input || '').trim()
+    let key = raw.toLowerCase().replace(/^@/, '')
+    for (let c of CREATORS) {
+        if (c.handle.toLowerCase() === key || c.name.toLowerCase() === key || c.aliases.includes(key)) {
+            return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name }
+        }
+    }
+    let t = channelTargetFrom(raw)
+    if (t && t.handle) {
+        for (let c of CREATORS) {
+            if (c.handle.toLowerCase() === t.handle.toLowerCase()) {
+                return { browseId: t.browseId || c.browseId, handle: c.handle, name: c.name, creator: c.name }
+            }
+        }
+    }
+    if (t && t.name) {
+        let nk = t.name.toLowerCase()
+        for (let c of CREATORS) {
+            if (c.name.toLowerCase() === nk || c.aliases.includes(nk)) {
+                return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name }
+            }
+        }
+    }
+    return t
 }
 
 function textResult(obj) {
@@ -350,6 +412,216 @@ const PICK_VIDEO_JS = `(() => {
 
 const PLAYER_JS = `document.querySelector(${JSON.stringify(PLAYER_SELECTOR)})`
 
+// ---------------------------------------------------------------------------
+// Screen readout ("eyes") — the phase 2 foundation.
+//
+// A structured snapshot of what is ACTUALLY rendered right now: the
+// page type, the channel header's identity when on a channel page,
+// the focused element, the current search-box text, and the visible
+// actionable items WITH their targets (each item's video/browse ID is
+// dug from that item's OWN data subtree, so IDs cannot scramble
+// across items the way whole-blob scraping did). Tools verify against
+// this — never against route strings or internal flags.
+// ---------------------------------------------------------------------------
+const SCREEN_JS = `(() => {
+    const clean = (s) => String(s || '').replace(/\\s+/g, ' ').trim()
+    const timeRe = /^\\d{1,2}:\\d{2}(:\\d{2})?$/
+    const ageRe = /(\\d+\\s*(?:second|minute|hour|day|week|month|year)s?\\s*ago|streamed\\s+\\d+\\s*\\w+\\s*ago|premiered|live now)/i
+    const handleRe = /@([\\w.-]+)/
+    const isVisible = (el) => {
+        try {
+            const r = el.getBoundingClientRect()
+            return r.width >= 8 && r.height >= 8 && r.bottom > 0 && r.right > 0 && r.top < innerHeight && r.left < innerWidth
+        } catch (e) { return false }
+    }
+    const centerOf = (el) => {
+        const r = el.getBoundingClientRect()
+        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+    }
+    // Dig the targets an element points at out of its own data subtree
+    // (the element itself first, then a few descendants, then one
+    // parent hop — in that order, first hit wins per field).
+    const digTargets = (el) => {
+        const out = { isShort: false }
+        const nodes = [el]
+        try {
+            const inner = el.querySelectorAll('*')
+            for (let i = 0; i < inner.length && nodes.length < 14; i++) nodes.push(inner[i])
+        } catch (e) {}
+        if (el.parentElement) nodes.push(el.parentElement)
+        for (const node of nodes) {
+            if (out.videoId && out.browseId) break
+            try {
+                const d = node.data || node.__data
+                if (!d) continue
+                const s = JSON.stringify(d).slice(0, 24000)
+                if (!out.videoId) {
+                    const m = s.match(/"videoId":\\s*"([\\w-]{11})"/)
+                    if (m) out.videoId = m[1]
+                }
+                if (!out.browseId) {
+                    const m = s.match(/"(?:browseId|channelId)":\\s*"(UC[\\w-]{22})"/)
+                    if (m) out.browseId = m[1]
+                }
+                if (!out.isShort && /reelWatch/.test(s)) out.isShort = true
+            } catch (e) {}
+        }
+        return out
+    }
+    const describeEl = (el, source) => {
+        const t = digTargets(el)
+        const c = centerOf(el)
+        return {
+            tag: (el.tagName || '').toLowerCase(),
+            label: clean(el.innerText || el.getAttribute('aria-label') || '').slice(0, 140) || null,
+            videoId: t.videoId || null,
+            browseId: t.browseId || null,
+            x: c.x, y: c.y,
+            source
+        }
+    }
+
+    const bodyText = clean(document.body ? document.body.innerText : '')
+    const lower = bodyText.toLowerCase()
+
+    // -- channel header: the rendered identity of a channel page.
+    // Several nested elements can carry 'channel' tags (up to the page
+    // root, whose text is the whole page) — prefer the SMALLEST
+    // element that carries a handle or a subscriber count.
+    let channelHeader = null
+    try {
+        const cands = []
+        for (const el of document.querySelectorAll('*')) {
+            const tag = (el.tagName || '').toLowerCase()
+            if (!tag.includes('channel')) continue
+            if (!isVisible(el)) continue
+            const text = clean(el.innerText || '')
+            if (text.length < 2) continue
+            cands.push({ el, text })
+        }
+        const matching = cands.filter(c => handleRe.test(c.text) || /subscribers/i.test(c.text))
+        matching.sort((a, b) => a.text.length - b.text.length)
+        cands.sort((a, b) => a.text.length - b.text.length)
+        const pick = matching[0] || cands[0]
+        if (pick) {
+            const lines = (pick.el.innerText || '').split('\\n').map(clean).filter(Boolean)
+            const hm = pick.text.match(handleRe)
+            const sm = pick.text.match(/([\\d.,]+\\s*[KM]?)\\s*subscribers/i)
+            const t = digTargets(pick.el)
+            channelHeader = {
+                name: lines[0] || null,
+                handle: hm ? hm[1] : null,
+                subscribers: sm ? sm[1] : null,
+                browseId: t.browseId || null,
+                text: pick.text.slice(0, 300)
+            }
+        }
+    } catch (e) {}
+
+    // -- visible actionable items, each with its own target
+    const items = []
+    try {
+        const els = document.querySelectorAll('YTLR-TILE-RENDERER, YTLR-AVATAR-LOCKUP, YTLR-GRID-TILE-RENDERER')
+        for (const el of els) {
+            if (items.length >= 24) break
+            if (!isVisible(el)) continue
+            const raw = el.innerText || ''
+            const lines = raw.split('\\n').map(clean).filter(Boolean)
+            if (lines.length === 0) continue
+            const t = digTargets(el)
+            const flat = clean(raw)
+            let durationText = null
+            for (const ln of lines) { if (timeRe.test(ln)) { durationText = ln; break } }
+            if (!durationText) {
+                const m = flat.match(/\\b\\d{1,2}:\\d{2}(:\\d{2})?\\b/)
+                if (m) durationText = m[0]
+            }
+            const am = flat.match(ageRe)
+            const hm = flat.match(handleRe)
+            let type = 'item'
+            if (t.videoId) type = 'video'
+            else if (t.browseId || hm) type = 'channel'
+            const c = centerOf(el)
+            items.push({
+                type,
+                title: lines[0].slice(0, 200),
+                videoId: t.videoId || null,
+                browseId: t.browseId || null,
+                handle: hm ? hm[1] : null,
+                durationText,
+                ageText: am ? am[0] : null,
+                isShort: !!t.isShort,
+                focused: !!(el.classList && (el.classList.contains('focused') || el.querySelector('.focused') !== null)),
+                x: c.x, y: c.y,
+                text: flat.slice(0, 300)
+            })
+        }
+    } catch (e) {}
+
+    // -- focused element (best effort: real focus first, then the
+    // framework's focus marker class)
+    let focused = null
+    try {
+        const ae = document.activeElement
+        if (ae && ae !== document.body && ae !== document.documentElement && isVisible(ae)) {
+            focused = describeEl(ae, 'activeElement')
+        }
+    } catch (e) {}
+    if (!focused) {
+        try {
+            for (const el of document.querySelectorAll('.focused, [data-focused="true"]')) {
+                if (isVisible(el)) { focused = describeEl(el, 'focus-class'); break }
+            }
+        } catch (e) {}
+    }
+
+    // -- search box text ('' when the box shows its placeholder)
+    let searchBoxText = null
+    try {
+        const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
+        if (box) {
+            const t = clean(box.innerText || '')
+            searchBoxText = (t === 'Search') ? '' : t
+        }
+    } catch (e) {}
+
+    // -- page classification, from rendered evidence only
+    let watchActive = false
+    try {
+        const wp = document.querySelector('YTLR-WATCH-PAGE')
+        if (wp) {
+            const r = wp.getBoundingClientRect()
+            watchActive = r.width > 100 && r.height > 100
+        }
+    } catch (e) {}
+    const hasSearchUi = !!document.querySelector('YTLR-SEARCH-KEYBOARD, YTLR-SEARCH-TEXT-BOX, YTLR-SEARCH-RESULTS, YTLR-SEARCH-RESPONSE-RENDERER')
+    let page = 'unknown'
+    if (lower.includes('watch as guest') || lower.includes("who's watching") || lower.includes('who is watching') || lower.includes('add account')) page = 'account-picker'
+    else if (watchActive) page = 'watch'
+    else if (hasSearchUi) page = 'search'
+    else if (channelHeader) page = 'channel'
+    else if (items.length > 0) page = 'browse'
+
+    let dialog = null
+    try {
+        for (const el of document.querySelectorAll('[role="dialog"], [role="alertdialog"]')) {
+            if (isVisible(el)) { dialog = clean(el.innerText || el.textContent || '').slice(0, 160) || true; break }
+        }
+    } catch (e) {}
+
+    return {
+        page,
+        href: location.href,
+        hash: location.hash || '',
+        focused,
+        channelHeader,
+        searchBoxText,
+        items,
+        dialog,
+        pageText: bodyText.slice(0, 300)
+    }
+})()`
+
 async function probe(webContents) {
     return await evalJS(webContents, PROBE_JS)
 }
@@ -372,6 +644,53 @@ function stateFromProbe(webContents, p) {
     if (p.pageText) out.pageText = p.pageText
     if (p.dialog) out.dialog = p.dialog
     return out
+}
+
+async function screenSnapshot(webContents) {
+    return await evalJS(webContents, SCREEN_JS)
+}
+
+// Assert-rendered-state check for channel pages: the RENDERED page
+// must be a channel page whose header identifies the target channel
+// AND which shows that channel's videos. Route strings are never
+// accepted as evidence (open_channel v1 set location.hash itself and
+// then "verified" against that same hash — the screen never changed).
+// A route pointing at a DIFFERENT channel vetoes an otherwise
+// matching header (a stale route from an earlier navigation).
+function channelScreenMatches(screen, target) {
+    if (!screen || screen.page !== 'channel' || !screen.channelHeader) return false
+    let h = screen.channelHeader
+    let identity = false
+    if (target.browseId && h.browseId && h.browseId === target.browseId) identity = true
+    if (!identity && target.handle && h.handle && h.handle.toLowerCase() === target.handle.toLowerCase()) identity = true
+    if (!identity && target.name && h.name && h.name.toLowerCase() === target.name.toLowerCase()) identity = true
+    if (!identity && target.name && h.name && h.name.toLowerCase().includes(target.name.toLowerCase())) identity = true
+    if (!identity) return false
+    let hash = (screen.hash || '').toLowerCase()
+    let hm = hash.match(/@([\w.-]+)/)
+    if (hm && target.handle && hm[1] !== target.handle.toLowerCase()) return false
+    let cm = hash.match(/channel\/(uc[\w-]{22})/)
+    if (cm && target.browseId && cm[1] !== target.browseId.toLowerCase()) return false
+    let vids = (screen.items || []).filter(i => i.type === 'video' && i.title)
+    return vids.length >= 1
+}
+
+// Compact form of a screen snapshot for tool outputs / diagnostics.
+function screenDigest(screen) {
+    if (!screen) return null
+    return {
+        page: screen.page,
+        focused: screen.focused ? (screen.focused.label || screen.focused.tag) : null,
+        channelHeader: screen.channelHeader ? {
+            name: screen.channelHeader.name,
+            handle: screen.channelHeader.handle,
+            browseId: screen.channelHeader.browseId
+        } : null,
+        itemCount: (screen.items || []).length,
+        firstItems: (screen.items || []).slice(0, 5).map(i => ({
+            type: i.type, title: i.title, videoId: i.videoId, durationText: i.durationText
+        }))
+    }
 }
 
 // Does this probe show the target video actually loaded as media?
@@ -747,8 +1066,23 @@ function createMcpServer({ getWindow, context }) {
             let webContents = getWebContents()
             let p = await probe(webContents)
             let out = stateFromProbe(webContents, p)
+            let screen = await screenSnapshot(webContents).catch(() => null)
+            if (screen) {
+                out.screenPage = screen.page
+                out.focused = screen.focused ? (screen.focused.label || screen.focused.tag || null) : null
+                if (screen.channelHeader) out.channelHeader = screen.channelHeader
+            }
             out.history = context.history.list().slice(-10)
             return textResult(out)
+        })
+
+    register('get_screen',
+        'Read the TV screen as structured data — the "eyes": the page type (browse / search / watch / channel / account-picker / unknown) classified from what is rendered, the channel header identity when on a channel page, the focused element (label + target + position), the current search-box text, and the visible items WITH their actionable targets (video IDs, channel handles/browse IDs, durations, positions for trusted clicks). This rendered state is the ground truth the other tools verify against.',
+        {},
+        async () => {
+            let webContents = getWebContents()
+            let screen = await screenSnapshot(webContents)
+            return textResult({ ok: true, url: webContents.getURL(), ...screen })
         })
 
     register('play',
@@ -1361,6 +1695,19 @@ function createMcpServer({ getWindow, context }) {
                             }
                         }
                     }
+                    // Rendered-state binding (phase 2): when the
+                    // on-screen items' IDs are readable, a data-store
+                    // candidate that shares NO id with what is actually
+                    // rendered is not this query's results, whatever
+                    // its fingerprint did. (The 'rendered' candidate
+                    // IS the on-screen items, so it is exempt; title
+                    // agreement already gates 'visible-verified'.)
+                    if (candidate && candidate.via === true && scan.lockupPairs.length > 0) {
+                        const renderedIds = new Set(scan.lockupPairs.map(x => x.id))
+                        if (!candidate.pairs.some(x => renderedIds.has(x.id))) {
+                            candidate = null
+                        }
+                    }
                     if (candidate) {
                         if (candidate.key === lastKey) stablePolls++
                         else { lastKey = candidate.key; stablePolls = 1 }
@@ -1411,6 +1758,7 @@ function createMcpServer({ getWindow, context }) {
                 return errorResult('search could not verify that the on-page results belong to "' + q + '" — the search response did not provably refresh for this query, so no results are returned rather than possibly-stale ones. Diagnostics: ' + JSON.stringify(diag))
             }
 
+            let finalScreen = await screenSnapshot(webContents).catch(() => null)
             let out = {
                 ok: true,
                 query: q,
@@ -1419,6 +1767,7 @@ function createMcpServer({ getWindow, context }) {
                 clearedExistingQuery: (typeof foundQuery !== 'undefined' && foundQuery) ? foundQuery : null,
                 boxEmptyBeforeTyping: existingQuery === '',
                 onSearchScreen: onSearch,
+                screenPage: finalScreen ? finalScreen.page : null,
                 resultsForQuery,
                 resultsFresh,
                 results,
@@ -1461,300 +1810,406 @@ function createMcpServer({ getWindow, context }) {
             return textResult(out)
         })
 
-    register('open_channel',
-        'Navigate VacuumTube directly to a channel page — e.g. open_channel({channel: "@AsmonTV"}), a channel ID (UC…), a channel URL, or a channel name. Uses the app\'s own navigation (browse-endpoint dispatch, in-page endpoint activation, then search + a trusted click on the channel entry) — never simulated remote keys. Verifies the channel page actually loaded before returning.',
-        { channel: z.string().describe('Channel handle (@AsmonTV), channel ID (UC…), channel URL, or channel name') },
-        async ({ channel }) => {
-            let target = channelTargetFrom(channel)
-            if (!target) return errorResult(`Could not parse a channel from: ${channel}`)
-            let webContents = getWebContents()
-            let attempts = []
+    // -- channel navigation core ------------------------------------------
+    // Navigate the app to a channel page and PROVE it from the rendered
+    // screen (channelScreenMatches: page type 'channel' + header
+    // identity match + that channel's videos on screen). Hash-route
+    // writes are GONE: the SPA ignores them, and v1 "verified" against
+    // the hash it had just written itself while the view never moved
+    // (live failure, 2026-11-06, three times). What remains are the
+    // app's own mechanisms — elements carrying the channel's browse
+    // endpoint, activated with trusted clicks (the primitive that
+    // play_video's tile clicks and the search flow already prove),
+    // the app's navigation event, and search + a trusted click on the
+    // rendered channel entry. Throws with diagnostics on failure.
+    async function openChannelCore(target, rawLabel) {
+        let webContents = getWebContents()
+        let attempts = []
 
-            let pickerVisible = (p) => {
-                if (!p) return false
-                const t = ((p.pageText || '') + ' ' + (p.dialog || '')).toLowerCase()
-                return t.includes('watch as guest') || t.includes('add account') ||
-                    t.includes("who's watching") || t.includes('who is watching')
+        let first = await screenSnapshot(webContents).catch(() => null)
+        if (first && first.page === 'account-picker') {
+            throw new Error('open_channel unavailable: the TV is on the "Who\'s Watching" profile picker — select a profile on the TV first, then retry')
+        }
+        if (first && channelScreenMatches(first, target)) {
+            return { ok: true, verified: true, strategy: 'already-on-channel', attempts, screen: first }
+        }
+
+        let waitForChannelScreen = async (timeoutMs) => {
+            let deadline = Date.now() + timeoutMs
+            let last = await screenSnapshot(webContents).catch(() => null)
+            while (!channelScreenMatches(last, target) && Date.now() < deadline) {
+                await sleep(400)
+                last = await screenSnapshot(webContents).catch(() => last)
             }
-            let startProbe = await probe(webContents).catch(() => null)
-            if (pickerVisible(startProbe)) {
-                return errorResult('open_channel unavailable: the TV is on the "Who\'s Watching" profile picker — select a profile on the TV first, then retry')
+            return { matched: channelScreenMatches(last, target), screen: last }
+        }
+
+        // Smallest visible element whose own data references the
+        // channel (optionally scoped to a subtree). Subscribe buttons
+        // also carry the channel ID in their data — never click those.
+        let findEndpointPoint = async (scopeSelector) => await evalJS(webContents, `(() => {
+            const want = ${JSON.stringify(target.browseId)}
+            const scopeSel = ${JSON.stringify(scopeSelector || '')}
+            const scope = scopeSel ? (document.querySelector(scopeSel) || document) : document
+            let best = null, bestArea = Infinity
+            for (const el of scope.querySelectorAll('*')) {
+                if (((el.innerText || '')).toLowerCase().includes('subscribe')) continue
+                let hit = false
+                try {
+                    const d = el.data || el.__data
+                    if (d && JSON.stringify(d).slice(0, 20000).includes(want)) hit = true
+                } catch (e) {}
+                if (!hit) {
+                    const href = el.getAttribute && (el.getAttribute('href') || '')
+                    if (href && href.includes(want)) hit = true
+                }
+                if (!hit) continue
+                const r = el.getBoundingClientRect()
+                if (r.width > 30 && r.height > 12 && r.bottom > 0 && r.top < innerHeight && r.left < innerWidth) {
+                    const area = r.width * r.height
+                    if (area < bestArea) { bestArea = area; best = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) } }
+                }
+            }
+            return best
+        })()`).catch(() => null)
+
+        // -- Strategy 1 (watch screens, browseId known): the watch
+        // page's channel byline carries the browse endpoint — clicking
+        // it is the app's own path from a video to its channel.
+        if (target.browseId && first && first.page === 'watch') {
+            let pt = await findEndpointPoint('YTLR-WATCH-PAGE')
+            attempts.push({ strategy: 'watch-byline-click', found: !!pt })
+            if (pt) {
+                clickPoint(webContents, pt.x, pt.y)
+                let r = await waitForChannelScreen(6000)
+                if (r.matched) return { ok: true, verified: true, strategy: 'watch-byline-click', attempts, screen: r.screen }
+            }
+        }
+
+        // -- Strategy 2 (browseId known): trusted click on the
+        // smallest in-page element referencing this channel (e.g. a
+        // channel tile/avatar on the current browse screen).
+        if (target.browseId) {
+            let pt = await findEndpointPoint(null)
+            attempts.push({ strategy: 'endpoint-element-click', found: !!pt })
+            if (pt) {
+                clickPoint(webContents, pt.x, pt.y)
+                let r = await waitForChannelScreen(5000)
+                if (r.matched) return { ok: true, verified: true, strategy: 'endpoint-element-click', attempts, screen: r.screen }
             }
 
-            // Extra channel-page evidence beyond the standard probe:
-            // the route, a longer page-text slice, and any visible
-            // channel-header element's text.
-            let channelProbe = async () => {
-                let base = await probe(webContents).catch(() => null)
-                let extra = await evalJS(webContents, `(() => {
-                    let headerText = ''
-                    try {
-                        for (const el of document.querySelectorAll('*')) {
-                            const tag = (el.tagName || '').toLowerCase()
-                            if (!tag.includes('channel')) continue
-                            const r = el.getBoundingClientRect()
-                            if (r.width > 100 && r.height > 20) {
-                                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim()
-                                if (t) { headerText = t.slice(0, 300); break }
+            // -- Strategy 3: dispatch the app's navigation event with
+            // a browse endpoint. Speculative — the framework may not
+            // listen for it — but now harmless: only the rendered
+            // assertion can call it a success.
+            let fired = await evalJS(webContents, `(() => {
+                const endpoint = { browseEndpoint: { browseId: ${JSON.stringify(target.browseId)} } }
+                const detail = { endpoint, browseEndpoint: endpoint.browseEndpoint }
+                const fired = []
+                const fire = (node, label) => {
+                    try { node.dispatchEvent(new CustomEvent('yt-navigate', { bubbles: true, composed: true, detail })); fired.push(label) } catch (e) {}
+                    try { node.dispatchEvent(new CustomEvent('yt-navigate-start', { bubbles: true, composed: true, detail })); } catch (e) {}
+                }
+                fire(document, 'document')
+                fire(window, 'window')
+                const app = document.querySelector('ytlr-app, ytlr-tv')
+                if (app) fire(app, 'app')
+                return fired
+            })()`).catch(() => [])
+            attempts.push({ strategy: 'navigate-event', fired })
+            let r = await waitForChannelScreen(4000)
+            if (r.matched) return { ok: true, verified: true, strategy: 'navigate-event', attempts, screen: r.screen }
+        }
+
+        // -- Strategy 4 (handle/name; the primary route for them):
+        // search for the channel, then a trusted MOUSE click on the
+        // rendered channel lockup. (Injected remote keys demonstrably
+        // do not move focus in the search UI; mouse clicks are the
+        // primitive that works there.)
+        let query = target.name || target.handle || ''
+        if (!query && target.browseId) {
+            for (let c of CREATORS) {
+                if (c.browseId && c.browseId === target.browseId) { query = c.name; break }
+            }
+        }
+        if (query) {
+            let before = await probe(webContents).catch(() => null)
+            if (before && before.watchView && before.watchView.active) {
+                tapKey(webContents, 'Escape')
+                await sleep(900)
+            }
+            let pill = await evalJS(webContents, `(() => {
+                const candidates = []
+                for (const el of document.querySelectorAll('*')) {
+                    if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'Search') candidates.push(el)
+                }
+                for (let el of candidates) {
+                    let node = el
+                    for (let i = 0; i < 4 && node; i++) {
+                        const r = node.getBoundingClientRect()
+                        if (r.width > 100 && r.height > 20) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                        node = node.parentElement
+                    }
+                }
+                return null
+            })()`).catch(() => null)
+            if (pill) clickPoint(webContents, pill.x, pill.y)
+            let onSearch = false
+            let sDeadline = Date.now() + 6000
+            while (Date.now() < sDeadline) {
+                let s = await screenSnapshot(webContents).catch(() => null)
+                if (s && s.page === 'search') { onSearch = true; break }
+                await sleep(300)
+            }
+            attempts.push({ strategy: 'search-then-click', searchScreenOpened: onSearch })
+            if (onSearch) {
+                let typeLabel = async (label) => {
+                    let pt = await evalJS(webContents, `(() => {
+                        const kb = document.querySelector('YTLR-SEARCH-KEYBOARD') || document
+                        for (const el of kb.querySelectorAll('*')) {
+                            if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
+                                const r = el.getBoundingClientRect()
+                                if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
                             }
                         }
-                    } catch (e) {}
-                    let text = ''
-                    try { text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 600) } catch (e) {}
-                    return { hash: location.hash || '', headerText, text }
-                })()`).catch(() => null)
-                return { base, extra }
-            }
-            let landed = ({ base, extra }) => {
-                if (!base && !extra) return false
-                let hash = ((extra && extra.hash) || (base && base.hash) || '').toLowerCase()
-                let href = ((base && base.href) || '').toLowerCase()
-                let text = (((extra && extra.text) || '') + ' ' + ((extra && extra.headerText) || '')).toLowerCase()
-                if (hash.includes('/channel/') || href.includes('/channel/')) return true
-                if (target.browseId && (hash.includes(target.browseId.toLowerCase()) || href.includes(target.browseId.toLowerCase()))) return true
-                if (target.handle && (hash.includes(target.handle.toLowerCase()) || text.includes('@' + target.handle.toLowerCase()))) return true
-                if (target.name && text.includes(target.name.toLowerCase())) return true
-                if (extra && extra.headerText) return true
-                return false
-            }
-            let waitForChannel = async (timeoutMs) => {
-                let deadline = Date.now() + timeoutMs
-                let last = await channelProbe()
-                while (!landed(last) && Date.now() < deadline) {
-                    await sleep(400)
-                    last = await channelProbe()
+                        return null
+                    })()`.replace('__LABEL__', label)).catch(() => null)
+                    if (pt) { clickPoint(webContents, pt.x, pt.y); return true }
+                    return false
                 }
-                return last
+                let readBox = async () => await evalJS(webContents, `(() => {
+                    const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
+                    if (!box) return ''
+                    const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
+                    return (t === 'Search') ? '' : t
+                })()`).catch(() => '')
+                // A previously submitted search collapses the
+                // keyboard; click the text box to reopen it.
+                let kbHas = await evalJS(webContents, `(() => {
+                    const kb = document.querySelector('YTLR-SEARCH-KEYBOARD')
+                    if (!kb) return false
+                    for (const el of kb.querySelectorAll('*')) {
+                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'A') {
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 5 && r.height > 5) return true
+                        }
+                    }
+                    return false
+                })()`).catch(() => false)
+                if (!kbHas) {
+                    let boxPt = await evalJS(webContents, `(() => {
+                        for (const el of document.querySelectorAll('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')) {
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 50 && r.height > 10) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                        }
+                        return null
+                    })()`).catch(() => null)
+                    if (boxPt) { clickPoint(webContents, boxPt.x, boxPt.y); await sleep(1200) }
+                }
+                // Matt's standing rule: CLEAR any pre-existing
+                // search-box text before typing.
+                let existing = await readBox()
+                for (let i = 0; i < 3 && existing; i++) {
+                    await typeLabel('CLEAR')
+                    await sleep(500)
+                    existing = await readBox()
+                }
+                let typed = ''
+                for (let ch of query) {
+                    if (/[a-z]/i.test(ch)) { if (await typeLabel(ch.toUpperCase())) typed += ch }
+                    else if (ch === ' ') { if (await typeLabel('SPACE')) typed += ' ' }
+                    else if (/[0-9]/.test(ch)) {
+                        if (await typeLabel('&123')) {
+                            await sleep(300)
+                            if (await typeLabel(ch)) typed += ch
+                            await typeLabel('ABC')
+                        }
+                    }
+                    await sleep(280)
+                }
+                attempts.push({ strategy: 'search-then-click', typed })
+                if (typed) {
+                    await typeLabel('SEARCH')
+                    await sleep(2500)
+                    // Find the rendered channel entry: a lockup whose
+                    // text carries an @handle, preferring an exact
+                    // handle/name match.
+                    let findLockup = async () => await evalJS(webContents, `(() => {
+                        const wantHandle = ${JSON.stringify(target.handle ? target.handle.toLowerCase() : '')}
+                        const wantName = ${JSON.stringify(target.name ? target.name.toLowerCase() : '')}
+                        let items = []
+                        for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
+                            items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                        }
+                        if (items.length === 0) items = Array.from(document.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                        let firstChannel = null
+                        for (const el of items) {
+                            const r = el.getBoundingClientRect()
+                            if (r.width < 40 || r.height < 20) continue
+                            const text = (el.innerText || '').replace(/\\s+/g, ' ')
+                            if (!/@[\\w.]+/.test(text)) continue
+                            const lower = text.toLowerCase()
+                            const pt = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: text.slice(0, 140) }
+                            if ((wantHandle && lower.includes('@' + wantHandle)) || (wantName && lower.includes(wantName))) return pt
+                            if (!firstChannel) firstChannel = pt
+                        }
+                        return firstChannel
+                    })()`).catch(() => null)
+                    let lockup = await findLockup()
+                    if (!lockup) { await sleep(1500); lockup = await findLockup() }
+                    attempts.push({ strategy: 'search-then-click', lockup: lockup ? lockup.text : null })
+                    if (lockup) {
+                        clickPoint(webContents, lockup.x, lockup.y)
+                        let r = await waitForChannelScreen(8000)
+                        attempts.push({ strategy: 'search-then-click', landedAssertion: r.matched })
+                        if (r.matched) return { ok: true, verified: true, strategy: 'search-then-click', attempts, screen: r.screen }
+                    }
+                }
             }
-            let finish = (cp, strategy) => textResult({
-                ok: true, verified: true, strategy,
+        }
+
+        let last = await screenSnapshot(webContents).catch(() => null)
+        throw new Error('open_channel could not land on the channel page for "' + rawLabel + '" — no strategy passed the rendered-state assertion (page type channel + header identity + that channel\'s videos on screen). Diagnostics: ' + JSON.stringify({
+            target, attempts, screen: screenDigest(last), pageText: last ? last.pageText : null
+        }))
+    }
+
+    register('open_channel',
+        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own mechanisms: trusted clicks on elements carrying the channel\'s browse endpoint, the app\'s navigation event, and search + a trusted click on the rendered channel entry. No simulated remote keys.',
+        { channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL') },
+        async ({ channel }) => {
+            let target = resolveChannelTarget(channel)
+            if (!target) return errorResult(`Could not parse a channel from: ${channel}`)
+            let r = await openChannelCore(target, String(channel))
+            let webContents = getWebContents()
+            return textResult({
+                ok: true, verified: true, strategy: r.strategy,
                 channel: String(channel),
                 ...(target.browseId ? { browseId: target.browseId } : {}),
                 ...(target.handle ? { handle: target.handle } : {}),
-                attempts,
-                ...(cp.extra ? { channelHeader: cp.extra.headerText || null, pageTextFull: cp.extra.text } : {}),
-                ...(cp.base ? stateFromProbe(webContents, cp.base) : {})
+                ...(target.name ? { name: target.name } : {}),
+                attempts: r.attempts,
+                channelHeader: r.screen ? r.screen.channelHeader : null,
+                videos: r.screen ? r.screen.items.filter(i => i.type === 'video').slice(0, 10).map(i => ({ title: i.title, videoId: i.videoId, durationText: i.durationText })) : [],
+                screen: screenDigest(r.screen),
+                url: webContents.getURL()
             })
+        })
 
-            // -- Strategy 1: dispatch the app's own navigation event
-            // with a browse endpoint (only possible with a known ID).
-            if (target.browseId) {
-                let fired = await evalJS(webContents, `(() => {
-                    const endpoint = { browseEndpoint: { browseId: ${JSON.stringify(target.browseId)} } }
-                    const detail = { endpoint, browseEndpoint: endpoint.browseEndpoint }
-                    const fired = []
-                    const fire = (node, label) => {
-                        try { node.dispatchEvent(new CustomEvent('yt-navigate', { bubbles: true, composed: true, detail })); fired.push(label) } catch (e) {}
-                        try { node.dispatchEvent(new CustomEvent('yt-navigate-start', { bubbles: true, composed: true, detail })); } catch (e) {}
+    // Click a channel-page tab ("Videos", "Shorts", …) by its exact
+    // rendered label — a trusted click, like every view-layer action
+    // here. Only leaf elements with exactly the tab's text and only
+    // the upper part of the screen qualify, so a video title can
+    // never be mistaken for the tab.
+    async function activateChannelTab(webContents, label) {
+        let pt = await evalJS(webContents, `(() => {
+            const want = ${JSON.stringify('__TAB__')}
+            for (const el of document.querySelectorAll('*')) {
+                if (el.children.length !== 0) continue
+                if (!el.textContent || el.textContent.trim() !== want) continue
+                let node = el
+                for (let i = 0; i < 4 && node; i++) {
+                    const r = node.getBoundingClientRect()
+                    if (r.width > 40 && r.height > 14 && r.top >= 0 && r.top < innerHeight * 0.55) {
+                        return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
                     }
-                    fire(document, 'document')
-                    fire(window, 'window')
-                    const app = document.querySelector('ytlr-app, ytlr-tv')
-                    if (app) fire(app, 'app')
-                    return fired
-                })()`).catch(() => [])
-                attempts.push({ strategy: 'navigate-event', fired })
-                let cp = await waitForChannel(4000)
-                if (landed(cp)) return finish(cp, 'navigate-event')
-
-                // -- Strategy 2: activate an in-page element whose own
-                // data references this browseId (trusted mouse click —
-                // the proven primitive in this app).
-                let pt = await evalJS(webContents, `(() => {
-                    const want = ${JSON.stringify(target.browseId)}
-                    for (const el of document.querySelectorAll('*')) {
-                        let hit = false
-                        try {
-                            const d = el.data || el.__data
-                            if (d && JSON.stringify(d).slice(0, 20000).includes(want)) hit = true
-                        } catch (e) {}
-                        if (!hit) {
-                            const href = el.getAttribute && (el.getAttribute('href') || '')
-                            if (href && href.includes(want)) hit = true
-                        }
-                        if (!hit) continue
-                        const r = el.getBoundingClientRect()
-                        if (r.width > 30 && r.height > 15 && r.bottom > 0 && r.top < innerHeight) {
-                            return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                        }
-                    }
-                    return null
-                })()`).catch(() => null)
-                attempts.push({ strategy: 'endpoint-element-click', found: !!pt })
-                if (pt) {
-                    clickPoint(webContents, pt.x, pt.y)
-                    let cp2 = await waitForChannel(4000)
-                    if (landed(cp2)) return finish(cp2, 'endpoint-element-click')
-                }
-
-                // -- Strategy 3: hash route (the SPA ignored this for
-                // watch pages; cheap to try for channel pages).
-                await evalJS(webContents, `location.hash = ${JSON.stringify('#/channel/' + target.browseId)}; true`).catch(() => {})
-                attempts.push({ strategy: 'hash-route' })
-                let cp3 = await waitForChannel(3000)
-                if (landed(cp3)) return finish(cp3, 'hash-route')
-            }
-
-            // -- Strategy 4: hash route by handle (cheap, same caveat).
-            if (target.handle) {
-                await evalJS(webContents, `location.hash = ${JSON.stringify('#/@' + target.handle)}; true`).catch(() => {})
-                attempts.push({ strategy: 'hash-route-handle' })
-                let cp = await waitForChannel(2500)
-                if (landed(cp)) return finish(cp, 'hash-route-handle')
-            }
-
-            // -- Strategy 5 (primary for handle/name): search for the
-            // channel, then a trusted MOUSE click on the rendered
-            // channel lockup. (Injected remote keys demonstrably do
-            // not move focus in the search UI; mouse clicks are the
-            // primitive that works there.) Compact re-implementation
-            // of the search screen flow — the verified search tool's
-            // closure is not shared, by design.
-            let query = target.name || target.handle || ''
-            if (query) {
-                let before = await probe(webContents).catch(() => null)
-                if (before && before.watchView && before.watchView.active) {
-                    tapKey(webContents, 'Escape')
-                    await sleep(900)
-                }
-                let pill = await evalJS(webContents, `(() => {
-                    const candidates = []
-                    for (const el of document.querySelectorAll('*')) {
-                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'Search') candidates.push(el)
-                    }
-                    for (let el of candidates) {
-                        let node = el
-                        for (let i = 0; i < 4 && node; i++) {
-                            const r = node.getBoundingClientRect()
-                            if (r.width > 100 && r.height > 20) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                            node = node.parentElement
-                        }
-                    }
-                    return null
-                })()`).catch(() => null)
-                if (pill) clickPoint(webContents, pill.x, pill.y)
-                let onSearch = false
-                let sDeadline = Date.now() + 6000
-                while (Date.now() < sDeadline) {
-                    let p = await probe(webContents).catch(() => null)
-                    if (p && (p.hash || '').startsWith('#/search')) { onSearch = true; break }
-                    await sleep(300)
-                }
-                attempts.push({ strategy: 'search-then-click', searchScreenOpened: onSearch })
-                if (onSearch) {
-                    let typeLabel = async (label) => {
-                        let pt = await evalJS(webContents, `(() => {
-                            const kb = document.querySelector('YTLR-SEARCH-KEYBOARD') || document
-                            for (const el of kb.querySelectorAll('*')) {
-                                if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
-                                    const r = el.getBoundingClientRect()
-                                    if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                                }
-                            }
-                            return null
-                        })()`.replace('__LABEL__', label)).catch(() => null)
-                        if (pt) { clickPoint(webContents, pt.x, pt.y); return true }
-                        return false
-                    }
-                    let readBox = async () => await evalJS(webContents, `(() => {
-                        const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
-                        if (!box) return ''
-                        const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
-                        return (t === 'Search') ? '' : t
-                    })()`).catch(() => '')
-                    // A previously submitted search collapses the
-                    // keyboard; click the text box to reopen it.
-                    let kbHas = await evalJS(webContents, `(() => {
-                        const kb = document.querySelector('YTLR-SEARCH-KEYBOARD')
-                        if (!kb) return false
-                        for (const el of kb.querySelectorAll('*')) {
-                            if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'A') {
-                                const r = el.getBoundingClientRect()
-                                if (r.width > 5 && r.height > 5) return true
-                            }
-                        }
-                        return false
-                    })()`).catch(() => false)
-                    if (!kbHas) {
-                        let boxPt = await evalJS(webContents, `(() => {
-                            for (const el of document.querySelectorAll('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')) {
-                                const r = el.getBoundingClientRect()
-                                if (r.width > 50 && r.height > 10) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                            }
-                            return null
-                        })()`).catch(() => null)
-                        if (boxPt) { clickPoint(webContents, boxPt.x, boxPt.y); await sleep(1200) }
-                    }
-                    // Matt's standing rule: CLEAR any pre-existing
-                    // search-box text before typing.
-                    let existing = await readBox()
-                    for (let i = 0; i < 3 && existing; i++) {
-                        await typeLabel('CLEAR')
-                        await sleep(500)
-                        existing = await readBox()
-                    }
-                    let typed = ''
-                    for (let ch of query) {
-                        if (/[a-z]/i.test(ch)) { if (await typeLabel(ch.toUpperCase())) typed += ch }
-                        else if (ch === ' ') { if (await typeLabel('SPACE')) typed += ' ' }
-                        else if (/[0-9]/.test(ch)) {
-                            if (await typeLabel('&123')) {
-                                await sleep(300)
-                                if (await typeLabel(ch)) typed += ch
-                                await typeLabel('ABC')
-                            }
-                        }
-                        await sleep(280)
-                    }
-                    attempts.push({ strategy: 'search-then-click', typed })
-                    if (typed) {
-                        await typeLabel('SEARCH')
-                        await sleep(2500)
-                        // Find the rendered channel entry: a lockup
-                        // whose text carries an @handle, preferring an
-                        // exact handle/name match.
-                        let findLockup = async () => await evalJS(webContents, `(() => {
-                            const wantHandle = ${JSON.stringify(target.handle ? target.handle.toLowerCase() : '')}
-                            const wantName = ${JSON.stringify(target.name ? target.name.toLowerCase() : '')}
-                            let items = []
-                            for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
-                                items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
-                            }
-                            if (items.length === 0) items = Array.from(document.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
-                            let firstChannel = null
-                            for (const el of items) {
-                                const r = el.getBoundingClientRect()
-                                if (r.width < 40 || r.height < 20) continue
-                                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
-                                if (!/@[\\w.]+/.test(text)) continue
-                                const lower = text.toLowerCase()
-                                const pt = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: text.slice(0, 140) }
-                                if ((wantHandle && lower.includes('@' + wantHandle)) || (wantName && lower.includes(wantName))) return pt
-                                if (!firstChannel) firstChannel = pt
-                            }
-                            return firstChannel
-                        })()`).catch(() => null)
-                        let lockup = await findLockup()
-                        if (!lockup) { await sleep(1500); lockup = await findLockup() }
-                        attempts.push({ strategy: 'search-then-click', lockup: lockup ? lockup.text : null })
-                        if (lockup) {
-                            clickPoint(webContents, lockup.x, lockup.y)
-                            let cp = await waitForChannel(6000)
-                            if (landed(cp)) return finish(cp, 'search-then-click')
-                            // A click that opened a video instead of
-                            // the channel is a miss, not a landing.
-                            attempts.push({ strategy: 'search-then-click', landed: false, hash: cp.extra ? cp.extra.hash : null })
-                        }
-                    }
+                    node = node.parentElement
                 }
             }
+            return null
+        })()`.replace('__TAB__', label)).catch(() => null)
+        if (!pt) return false
+        clickPoint(webContents, pt.x, pt.y)
+        await sleep(2000)
+        return true
+    }
 
-            let last = await channelProbe()
-            return errorResult('open_channel could not navigate to "' + String(channel) + '" — no strategy landed on the channel page. Diagnostics: ' + JSON.stringify({
-                target, attempts,
-                ...(last.extra ? { hash: last.extra.hash, channelHeader: last.extra.headerText, pageTextFull: last.extra.text } : {}),
-                ...(last.base ? stateFromProbe(webContents, last.base) : {})
+    // Land on a channel page (asserted), switch to its Videos tab
+    // when one is rendered, and read the uploads off the screen
+    // readout — in on-screen order, which on the Videos tab is
+    // newest first. This is the collection half of the "play what
+    // <creator> posted today" feature (CREATORS.md feature 3).
+    async function channelUploadsCore(channelArg, limit = 10) {
+        let target = resolveChannelTarget(channelArg)
+        if (!target) throw new Error(`Could not parse a channel from: ${channelArg}`)
+        let webContents = getWebContents()
+        let landedRes = await openChannelCore(target, String(channelArg))
+        let tabUsed = 'channel-home'
+        if (await activateChannelTab(webContents, 'Videos')) {
+            tabUsed = 'videos-tab'
+        }
+        let screen = await screenSnapshot(webContents).catch(() => null)
+        if (!screen || screen.page !== 'channel') {
+            throw new Error('channel_uploads lost the channel page after landing (screen: ' +
+                JSON.stringify(screenDigest(screen)) + ')')
+        }
+        let uploads = screen.items
+            .filter(i => i.type === 'video' && i.videoId)
+            .slice(0, Math.max(1, Math.min(30, limit)))
+            .map(i => ({
+                title: i.title,
+                videoId: i.videoId,
+                durationText: i.durationText,
+                durationSeconds: parseDurationText(i.durationText),
+                ageText: i.ageText,
+                isShort: i.isShort
             }))
+        return {
+            ok: true,
+            channel: {
+                ...(target.name ? { name: target.name } : {}),
+                ...(target.handle ? { handle: target.handle } : {}),
+                ...(target.browseId ? { browseId: target.browseId } : {}),
+                headerName: screen.channelHeader ? screen.channelHeader.name : null,
+                headerHandle: screen.channelHeader ? screen.channelHeader.handle : null
+            },
+            navStrategy: landedRes.strategy,
+            tabUsed,
+            uploads,
+            screen: screenDigest(screen)
+        }
+    }
+
+    register('channel_uploads',
+        'List a channel\'s uploads as rendered on its channel page (Videos tab when one is shown): title, video ID, duration, and age text for each, newest first. The channel-page landing is verified against the rendered screen first. Accepts a creator name/alias, a handle, a channel ID, or a URL.',
+        {
+            channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL'),
+            limit: z.number().int().min(1).max(30).optional().describe('Max uploads to return (default 10)')
+        },
+        async ({ channel, limit }) => {
+            let r = await channelUploadsCore(channel, limit || 10)
+            return textResult(r)
+        })
+
+    register('latest_video',
+        'Resolve a channel\'s newest regular upload — title, video ID, and duration — in one call, read from the channel\'s own page inside the app (no web lookup). Skips Shorts. With play: true it also plays the video (verified the same way play_video verifies). Accepts a creator name/alias ("Asmongold", "minus tech tips"), a handle, a channel ID, or a URL.',
+        {
+            channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL'),
+            play: z.boolean().optional().describe('Also play the video after resolving it (default false)')
+        },
+        async ({ channel, play }) => {
+            let r = await channelUploadsCore(channel, 12)
+            let first = r.uploads.find(u => !u.isShort) || r.uploads[0] || null
+            if (!first) {
+                return errorResult('latest_video found no uploads on the channel page for "' + String(channel) + '". Screen: ' + JSON.stringify(r.screen))
+            }
+            let out = {
+                ok: true,
+                channel: r.channel,
+                title: first.title,
+                videoId: first.videoId,
+                durationText: first.durationText,
+                durationSeconds: first.durationSeconds,
+                ageText: first.ageText,
+                source: 'channel-page',
+                tabUsed: r.tabUsed
+            }
+            if (play) {
+                let pr = await playVideoCore(first.videoId, { record: true })
+                out.played = !!pr.ok
+                out.playResult = pr
+            }
+            return textResult(out)
         })
 
     register('back',
