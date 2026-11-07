@@ -45,36 +45,73 @@ code changes. To revoke an agent, remove its token and restart.
 
 | Tool | Arguments | What it does |
 | --- | --- | --- |
-| `play_video` | `video`: video ID or YouTube URL | Navigates the window to that video in the Leanback UI and plays it. **Verifies** the switch before returning (see below) |
-| `get_state` | — | Current URL, video state (`paused`, `currentTime`, `duration`, `volume`, …), a short page hint, and the recent watch history |
+| `play_video` | `video`: video ID or YouTube URL | Plays that video on the watch screen via the app's own player API. **Verifies** the switch before returning (see below) |
+| `get_state` | — | The current video **from the player API** (the URL does not follow programmatic switches), video state, whether the watch screen is actually showing, the player-API volume, a short page hint, and the recent watch history |
 | `play` | — | Resumes playback |
 | `pause` | — | Pauses playback |
 | `seek` | `seconds`: number | Seeks to an absolute position |
 | `set_volume` | `volume`: 0–100 | Sets playback volume |
-| `navigate_home` | — | Back to the YouTube TV home screen |
-| `search` | `query`: string | Opens the TV search screen for the query; returns the top results (title + video ID) scraped from the page when possible |
+| `navigate_home` | — | Back to the YouTube TV home screen (real Escape key) |
+| `search` | `query`: string | Opens the TV search screen, **clears any text already in the search box**, types the query on the on-screen keyboard, and returns the top 10 results (title + video ID) from the search response data |
 | `back` | `steps`: optional, 1–10 | Returns to a previously watched video (see History) |
 
-## Navigation & verification (why play_video can be trusted)
+## How control works (learned live — read this before "fixing" navigation)
 
-Changing the Leanback route is not the same as changing the video — the SPA
-can update the URL while the old media keeps playing, or create a fresh
-player element that never loads. So `play_video` escalates through several
-navigation strategies (in-page hash change → pushState + events → home,
-settle, then hash → full reload at the watch route) and, after each one,
-polls the page until the media element actually shows the target video
-(route id matches, real duration present, and — when switching — a
-different media source than the video being left). The result reports
-`verified: true` and which `strategy` worked, or `verified: false` with the
-page state attached so the failure is diagnosable. All page scripts run
-under a timeout (`VACUUMTUBE_MCP_JS_TIMEOUT_MS`, default 5000 ms), and the
-transport tools never await media `play()` promises, so no tool can hang
-on a wedged page.
+The Leanback SPA **does not route on URL/hash changes at all** — it only
+*writes* the URL as a side effect of its own navigation, and even full
+reloads strip watch URLs back to home. Hash/loadURL navigation (the v1/v2
+approach) changed nothing on screen. What works is what the app itself
+uses, verified against the running app via CDP:
+
+1. **The player element's own API.** `#ytlr-player__player-container-player`
+   exposes the classic player API: `loadVideoById`, `getVideoData`,
+   `playVideo`, `pauseVideo`, `seekTo`, `setVolume`. `loadVideoById`
+   switches media instantly, from any screen. The transport tools prefer
+   these methods too.
+2. **Trusted input for the view layer.** Loading a video while a browse
+   screen is in front plays it *behind* the UI — the view follows only
+   real input. So `play_video`, when the watch screen isn't showing,
+   first clicks a browse tile with trusted `webContents.sendInputEvent`
+   events to enter the watch screen (muted; the player is hijacked with
+   the target immediately, so the tile's video is at most a buffering
+   glimpse), then loads the target via the API. From the search screen
+   there are no tiles, so it presses Escape to a browse screen first.
+3. **`getVideoData().video_id` is the authoritative current video.** The
+   URL keeps showing whatever the app last navigated to by hand, so the
+   probe, the switch verification, and the history observer all prefer
+   the player ID over the route ID.
+
+`play_video` verifies before returning: it polls until the player reports
+the target ID with a real duration and a loaded media source, and reports
+`verified` + the `strategy` used (`player-api`, `tile-then-player-api`,
+`already-playing`). Route/hash tricks remain only as a last-ditch
+fallback. All page scripts run under a timeout
+(`VACUUMTUBE_MCP_JS_TIMEOUT_MS`, default 5000 ms), and no tool awaits
+media `play()` promises, so nothing can hang on a wedged page.
+
+`search` has its own quirks, also verified live: the search screen has
+**no text input element** and synthetic text (`insertText`, char events)
+never reaches it — the query is typed by clicking the on-screen
+keyboard's keys. Letters, SPACE, CLEAR and SEARCH live in the
+`YTLR-SEARCH-KEYBOARD` subtree; digits hide behind the `&123` mode key.
+The tool first reads the search box and CLEARs any pre-existing text
+(reported as `clearedExistingQuery`), so a user's half-typed query is
+replaced, never appended to. Results are read from
+`YTLR-SEARCH-RESPONSE-RENDERER.data`, whose video IDs and titles appear
+in matching order, and are only accepted once the page's
+"Search results for <query>" header matches what was typed
+(`resultsForQuery`) — the previous query's data otherwise lingers and
+would be returned stale.
 
 `get_state` probes **all** `<video>` elements and reports the active one
-(largest/loaded/playing), plus a compact page hint: the first ~200
-characters of visible page text and any visible dialog's text — enough to
-spot interstitials (profile pickers, sign-in prompts) from the tool output.
+(largest/loaded/playing), plus the watch-screen rect (`watchView.active`
+= the video is actually on screen), the player state/error fields, and a
+compact page hint: the first ~200 characters of visible page text and
+any visible dialog's text — enough to spot interstitials (profile
+pickers, sign-in prompts) from the tool output. One known wrinkle:
+`videoTitle` reflects the app's routed video, so right after an
+API-driven switch it can lag one video behind; IDs and timestamps in
+the history are always exact.
 
 ## History & back()
 
