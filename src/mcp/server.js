@@ -941,11 +941,31 @@ function createMcpServer({ getWindow, context }) {
                 return out
             })()`).catch(() => [])
 
+            // The previous search's response data lingers in the page
+            // while a new query loads, so results alone aren't proof
+            // they're for THIS query — also require the page's
+            // "Search results for <query>" header to match what was
+            // typed before accepting them.
             let results = []
-            let rDeadline = Date.now() + 10000
+            let resultsForQuery = false
+            let rDeadline = Date.now() + 12000
+            let headerCheck = async () => await evalJS(webContents, `(() => {
+                const t = (document.body.innerText || '').replace(/\\s+/g, ' ')
+                const i = t.toLowerCase().indexOf('search results for ')
+                if (i < 0) return null
+                return t.slice(i + 19, i + 80).trim().toLowerCase()
+            })()`).catch(() => null)
             for (;;) {
                 results = await scrape()
-                if (results.length > 0 || Date.now() >= rDeadline) break
+                if (results.length > 0) {
+                    let header = await headerCheck()
+                    let want = typed.trim().toLowerCase()
+                    if (!want || (header && header.startsWith(want.slice(0, 24)))) {
+                        resultsForQuery = true
+                        break
+                    }
+                }
+                if (Date.now() >= rDeadline) break
                 await sleep(700)
             }
 
@@ -955,12 +975,15 @@ function createMcpServer({ getWindow, context }) {
                 query: q,
                 typedQuery: typed,
                 onSearchScreen: onSearch,
+                resultsForQuery,
                 results,
                 ...(p ? stateFromProbe(webContents, p) : {})
             }
             if (skipped) out.skippedCharacters = skipped
             if (results.length === 0) {
                 out.note = 'no results could be scraped from the search page (see pageText for what the TV is showing)'
+            } else if (!resultsForQuery) {
+                out.note = 'results may be stale — the page header never confirmed they belong to this query'
             }
             return textResult(out)
         })
