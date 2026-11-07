@@ -874,7 +874,8 @@ function createMcpServer({ getWindow, context }) {
             // clicks; results then render live as the query grows.
             let typeLabel = async (label) => {
                 let pt = await evalJS(webContents, `(() => {
-                    for (const el of document.querySelectorAll('YT-KEYBOARD-KEY, [class*="keyboard" i] *')) {
+                    const kb = document.querySelector('YTLR-SEARCH-KEYBOARD') || document
+                    for (const el of kb.querySelectorAll('*')) {
                         if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
                             const r = el.getBoundingClientRect()
                             if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
@@ -915,49 +916,27 @@ function createMcpServer({ getWindow, context }) {
                 }
             }
 
-            // Wait for and scrape the results. Search results are not
-            // tiles: they live in YTLR-SEARCH-RESULTS as AVATAR-LOCKUP
-            // items (verified live); fall back to tile-like containers.
+            // Wait for and scrape the results. The rendered items are
+            // virtualized rows without usable per-item data, but the
+            // search response renderer's data object carries the full
+            // result set: video IDs and titles appear in result order
+            // (verified live — first ID matches first title). Zip them.
             let scrape = async () => await evalJS(webContents, `(() => {
-                const out = []
+                const el = document.querySelector('YTLR-SEARCH-RESPONSE-RENDERER')
+                if (!el || !el.data) return []
+                const s = JSON.stringify(el.data)
+                const ids = []
                 const seen = new Set()
-                const digId = (el) => {
-                    let node = el
-                    for (let i = 0; i < 3 && node; i++) {
-                        try {
-                            const d = node.data || node.__data
-                            if (d) {
-                                const s = JSON.stringify(d).slice(0, 12000)
-                                const m = s.match(/"videoId":\\s*"([\\w-]{11})"/)
-                                if (m) return m[1]
-                            }
-                        } catch (e) {}
-                        node = node.parentElement
-                    }
-                    return null
+                for (const m of s.matchAll(/"videoId":\\s*"([\\w-]{11})"/g)) {
+                    if (!seen.has(m[1])) { seen.add(m[1]); ids.push(m[1]) }
                 }
-                const containers = document.querySelectorAll('YTLR-SEARCH-RESULTS')
-                let items = []
-                if (containers.length > 0) {
-                    for (const c of containers) {
-                        items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
-                    }
+                const titles = []
+                for (const m of s.matchAll(/"title":\\{"simpleText":"((?:[^"\\\\]|\\\\.)*)"/g)) {
+                    try { titles.push(JSON.parse('"' + m[1] + '"')) } catch (e) { titles.push(m[1]) }
                 }
-                if (items.length === 0) {
-                    items = Array.from(document.querySelectorAll('YTLR-TILE-RENDERER'))
-                }
-                for (const el of items) {
-                    const r = el.getBoundingClientRect()
-                    if (r.width < 40 || r.height < 20) continue
-                    const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
-                    if (!text) continue
-                    const id = digId(el)
-                    const key = id || text.slice(0, 60)
-                    if (seen.has(key)) continue
-                    seen.add(key)
-                    const lines = text.split(/(?=\\d+:\\d{2})|(?=LIVE)/)
-                    out.push({ id: id, title: (lines[0] || text).slice(0, 160), detail: text.slice(0, 240) })
-                    if (out.length >= 10) break
+                const out = []
+                for (let i = 0; i < Math.min(10, ids.length); i++) {
+                    out.push({ id: ids[i], title: titles[i] || null })
                 }
                 return out
             })()`).catch(() => [])
