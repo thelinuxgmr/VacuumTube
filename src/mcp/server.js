@@ -56,6 +56,13 @@
 // and endpoint strategies they used to sabotage by destroying the
 // watch page. Creator browseIds are baked into CREATORS.
 //
+// v3.17: the RSS feed endpoint is dead (404 from two networks,
+// even for channels whose own pages link the feed URL) --
+// newest-upload resolution now reads the channel's /videos page
+// markup, whose initial data lists uploads newest-first
+// (validated live 2026-11-06 against the home feed's newest
+// Asmongold TV upload).
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -1847,9 +1854,9 @@ function createMcpServer({ getWindow, context }) {
     // play_video's tile clicks and the search flow already prove),
     // the app's navigation event, and search + a trusted click on the
     // rendered channel entry. Throws with diagnostics on failure.
-    // Fetch a URL as text (server-side; used for channel RSS feeds
-    // and for resolving a handle to its UC... browseId from the
-    // channel page's own markup).
+    // Fetch a URL as text (server-side; used for channel videos
+    // pages and for resolving a handle to its UC... browseId from
+    // the channel page's own markup).
     function fetchText(url, timeoutMs = 9000) {
         return new Promise((resolve, reject) => {
             let req = https.get(url, {
@@ -1878,13 +1885,21 @@ function createMcpServer({ getWindow, context }) {
         })
     }
 
-    // The channel's newest upload IDs from its public RSS feed --
-    // deterministic and search-free. Entries are newest-first.
-    async function latestRssVideoIds(browseId, max = 3) {
-        let xml = await fetchText(`https://www.youtube.com/feeds/videos.xml?channel_id=${browseId}`)
+    // The channel's newest upload IDs, read from its own videos
+    // page markup -- deterministic and search-free. (The RSS feed
+    // endpoint 404s now -- verified 2026-11-06 from two networks,
+    // even for channels whose own pages link it.) The page's
+    // initial data lists uploads newest-first.
+    async function latestChannelVideoIds(target, max = 3) {
+        let url = null
+        if (target.handle) url = `https://www.youtube.com/@${target.handle}/videos`
+        else if (target.browseId) url = `https://www.youtube.com/channel/${target.browseId}/videos`
+        else if (target.name) url = `https://www.youtube.com/user/${encodeURIComponent(target.name.replace(/\s+/g, ''))}/videos`
+        if (!url) return []
+        let html = await fetchText(url)
         let ids = []
-        for (let m of xml.matchAll(/<yt:videoId>([\w-]{11})<\/yt:videoId>/g)) {
-            ids.push(m[1])
+        for (let m of html.matchAll(/"videoId":"([\w-]{11})"/g)) {
+            if (!ids.includes(m[1])) ids.push(m[1])
             if (ids.length >= max) break
         }
         return ids
@@ -1972,8 +1987,8 @@ function createMcpServer({ getWindow, context }) {
 
         // -- Strategy A (v3.16, PRIMARY): the video-byline hop.
         // The app's own path to a channel is through one of its
-        // videos: load the channel's newest upload (RSS --
-        // deterministic, no search), pause it, and click the watch
+        // videos: load the channel's newest upload (its videos
+        // page -- deterministic, no search), pause it, and click the watch
         // page's byline element, whose data carries the channel's
         // browseId (proven live 2026-11-06: the focused byline
         // element on Asmongold TV's video carried UCQeRaTuk...).
@@ -1984,8 +1999,8 @@ function createMcpServer({ getWindow, context }) {
             attempts.push({ strategy: 'video-byline', browseId: hopBrowseId || null })
             if (hopBrowseId) {
                 if (!target.browseId) target = { ...target, browseId: hopBrowseId }
-                let hopIds = await latestRssVideoIds(hopBrowseId).catch(() => [])
-                attempts.push({ strategy: 'video-byline', rssVideoIds: hopIds })
+                let hopIds = await latestChannelVideoIds(target).catch(() => [])
+                attempts.push({ strategy: 'video-byline', videoIds: hopIds })
                 let findBylinePoint = async () => await evalJS(webContents, `(() => {
                     const want = ${JSON.stringify(hopBrowseId)}
                     let best = null, bestArea = Infinity
@@ -2127,7 +2142,7 @@ function createMcpServer({ getWindow, context }) {
     }
 
     register('open_channel',
-        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own path: the channel\'s newest upload (resolved from its RSS feed) is loaded and its byline clicked through to the channel page, with the browse-endpoint mechanisms and the saved-URL route as backups. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
+        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own path: the channel\'s newest upload (resolved from its videos page) is loaded and its byline clicked through to the channel page, with the browse-endpoint mechanisms and the saved-URL route as backups. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
         { channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL') },
         async ({ channel }) => {
             let target = resolveChannelTarget(channel)
