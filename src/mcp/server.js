@@ -967,6 +967,29 @@ function createMcpServer({ getWindow, context }) {
                     return null
                 }
                 const idRe = /^[\\w-]{11}$/
+                // Find a title within an item's own subtree. Leanback
+                // items are tileRenderers: the ID is contentId on the
+                // item, but the title lives deeper, at
+                // metadata.tileMetadata.title — NOT on the item object
+                // itself (v3.8 looked only at direct props and paired
+                // nothing on the real response; found in live
+                // acceptance). Depth-capped so a nested item's title
+                // is not borrowed.
+                const findTitle = (node, depth) => {
+                    if (!node || typeof node !== 'object' || depth > 4) return null
+                    if (Array.isArray(node)) {
+                        for (const c of node) { const t = findTitle(c, depth + 1); if (t) return t }
+                        return null
+                    }
+                    const direct = titleText(node.title) || titleText(node.headline)
+                    if (direct) return direct
+                    for (const k of Object.keys(node)) {
+                        if (k === 'title' || k === 'headline') continue
+                        const t = findTitle(node[k], depth + 1)
+                        if (t) return t
+                    }
+                    return null
+                }
                 // Pair each video ID with the title from the SAME item
                 // object. (The v3.3 approach regex-zipped every videoId
                 // and every title in the whole stringified response;
@@ -976,7 +999,7 @@ function createMcpServer({ getWindow, context }) {
                     const seen = new Set()
                     let nodes = 0
                     const walk = (node, depth) => {
-                        if (!node || typeof node !== 'object' || pairs.length >= 10 || depth > 14 || ++nodes > 30000) return
+                        if (!node || typeof node !== 'object' || pairs.length >= 10 || depth > 14 || ++nodes > 60000) return
                         if (Array.isArray(node)) {
                             for (const c of node) { walk(c, depth + 1); if (pairs.length >= 10) return }
                             return
@@ -986,8 +1009,7 @@ function createMcpServer({ getWindow, context }) {
                             if (typeof node[k] === 'string' && idRe.test(node[k])) { id = node[k]; break }
                         }
                         if (id) {
-                            const t = titleText(node.title) || titleText(node.headline) ||
-                                (node.metadata ? titleText(node.metadata.title) : null)
+                            const t = findTitle(node, 0)
                             if (t) {
                                 if (!seen.has(id)) { seen.add(id); pairs.push({ id, title: t }) }
                                 return // an item object: do not descend into it
@@ -1018,7 +1040,7 @@ function createMcpServer({ getWindow, context }) {
                             if (typeof node[k] === 'string' && chanRe.test(node[k])) { id = node[k]; break }
                         }
                         if (id && !node.videoId) {
-                            const t = titleText(node.title) || (node.metadata ? titleText(node.metadata.title) : null)
+                            const t = findTitle(node, 0)
                             if (t) {
                                 if (!seen.has(id)) { seen.add(id); chans.push({ id, title: t }) }
                                 return
@@ -1088,9 +1110,60 @@ function createMcpServer({ getWindow, context }) {
                 const bt = (document.body.innerText || '').replace(/\\s+/g, ' ')
                 const hi = bt.toLowerCase().indexOf('search results for ')
                 const header = hi < 0 ? null : bt.slice(hi + 19, hi + 80).trim().toLowerCase()
-                return { renderers, visibleTitles, lockupPairs, visibleChannels, header }
+                let shape = null
+                try {
+                    const el0 = document.querySelector('YTLR-SEARCH-RESPONSE-RENDERER')
+                    if (el0 && el0.data) {
+                        const s0 = JSON.stringify(el0.data)
+                        const iV = s0.indexOf('videoId')
+                        const iC = s0.indexOf('contentId')
+                        shape = {
+                            len: s0.length, videoIdAt: iV, contentIdAt: iC,
+                            videoCtx: iV >= 0 ? s0.slice(Math.max(0, iV - 120), iV + 160) : null,
+                            contentCtx: iC >= 0 ? s0.slice(Math.max(0, iC - 120), iC + 220) : null,
+                            keys: Object.keys(el0.data).slice(0, 20)
+                        }
+                    }
+                } catch (e) {}
+                return { renderers, visibleTitles, lockupPairs, visibleChannels, header, shape }
             })()`).catch(() => null)
             let searchSnapshot = null
+
+            // After a SUBMITTED search the results view replaces the
+            // on-screen keyboard — a follow-up search then finds no
+            // clickable keys at all (live acceptance, v3.9: every
+            // search after the first failed with "could not be
+            // typed"). Clicking the search text box reopens the
+            // keyboard; ensure it is present before clearing/typing.
+            let ensureKeyboard = async () => {
+                let hasKeys = async () => await evalJS(webContents, `(() => {
+                    const kb = document.querySelector('YTLR-SEARCH-KEYBOARD')
+                    if (!kb) return false
+                    for (const el of kb.querySelectorAll('*')) {
+                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'A') {
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 5 && r.height > 5) return true
+                        }
+                    }
+                    return false
+                })()`).catch(() => false)
+                if (await hasKeys()) return true
+                let box = await evalJS(webContents, `(() => {
+                    for (const el of document.querySelectorAll('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')) {
+                        const r = el.getBoundingClientRect()
+                        if (r.width > 50 && r.height > 10) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                    }
+                    return null
+                })()`).catch(() => null)
+                if (box) clickPoint(webContents, box.x, box.y)
+                let kDeadline = Date.now() + 5000
+                while (Date.now() < kDeadline) {
+                    await sleep(300)
+                    if (await hasKeys()) return true
+                }
+                return false
+            }
+            if (onSearch) await ensureKeyboard()
 
             // Own the search box: if the user (or an earlier search)
             // left text in it, clear it with the keyboard's CLEAR key
@@ -1281,6 +1354,7 @@ function createMcpServer({ getWindow, context }) {
                     typedQuery: typed,
                     submitted,
                     headerSeen: lastScan ? lastScan.header : null,
+                    shape: lastScan ? lastScan.shape : null,
                     renderersSeen: lastScan ? lastScan.renderers.length : 0,
                     rendererPairs: lastScan ? lastScan.renderers.map(r => r.pairs.length) : [],
                     visibleTitles: lastScan ? lastScan.visibleTitles : [],
@@ -1540,6 +1614,29 @@ function createMcpServer({ getWindow, context }) {
                         const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
                         return (t === 'Search') ? '' : t
                     })()`).catch(() => '')
+                    // A previously submitted search collapses the
+                    // keyboard; click the text box to reopen it.
+                    let kbHas = await evalJS(webContents, `(() => {
+                        const kb = document.querySelector('YTLR-SEARCH-KEYBOARD')
+                        if (!kb) return false
+                        for (const el of kb.querySelectorAll('*')) {
+                            if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'A') {
+                                const r = el.getBoundingClientRect()
+                                if (r.width > 5 && r.height > 5) return true
+                            }
+                        }
+                        return false
+                    })()`).catch(() => false)
+                    if (!kbHas) {
+                        let boxPt = await evalJS(webContents, `(() => {
+                            for (const el of document.querySelectorAll('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')) {
+                                const r = el.getBoundingClientRect()
+                                if (r.width > 50 && r.height > 10) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                            }
+                            return null
+                        })()`).catch(() => null)
+                        if (boxPt) { clickPoint(webContents, boxPt.x, boxPt.y); await sleep(1200) }
+                    }
                     // Matt's standing rule: CLEAR any pre-existing
                     // search-box text before typing.
                     let existing = await readBox()
