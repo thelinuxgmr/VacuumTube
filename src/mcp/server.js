@@ -35,6 +35,10 @@
 // play_video combines both and verifies the result against the page
 // (player video id + real duration + media source) before returning.
 //
+// v3.14: the search keyboard typer reaches digits AND symbols via the
+// &123 keyboard page — previously any non-letter/non-space character
+// (incl. '@') was silently skipped, so handle searches lost the '@'.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -1573,8 +1577,13 @@ function createMcpServer({ getWindow, context }) {
                     } else if (ch === ' ') {
                         if (await typeLabel('SPACE')) typed += ' '
                         else skipped += ch
-                    } else if (/[0-9]/.test(ch)) {
-                        // Digits live behind the &123 keyboard mode.
+                    } else {
+                        // Digits and symbols (incl. '@') live behind the
+                        // &123 keyboard mode. (v3.14: this branch used to
+                        // cover digits only and every other character —
+                        // '@' included — was silently skipped, so a handle
+                        // search like '@LinusTechTips' reached the box as
+                        // 'linustechtips' and landed on wrong results.)
                         if (await typeLabel('&123')) {
                             await sleep(300)
                             if (await typeLabel(ch)) typed += ch
@@ -1583,8 +1592,6 @@ function createMcpServer({ getWindow, context }) {
                         } else {
                             skipped += ch
                         }
-                    } else {
-                        skipped += ch
                     }
                     await sleep(280)
                 }
