@@ -288,6 +288,14 @@ async function main() {
 
     userstyles.startWatcher()
 
+    //optional MCP control server for AI agents (token-gated, localhost only,
+    //disabled unless tokens are configured) — see src/mcp/server.js
+    try {
+        require('./mcp/server.js').start({ getWindow: () => win, userData })
+    } catch (err) {
+        console.error('Failed to start MCP server', err)
+    }
+
     electron.app.on('activate', () => {
         if (electron.BrowserWindow.getAllWindows().length === 0) createWindow()
     })
