@@ -642,6 +642,15 @@ function createMcpServer({ getWindow, context }) {
         if (!onWatchView) {
             let entered = await enterWatchView(webContents, before)
             attempts.push({ strategy: 'enter-watch-view', matched: entered })
+            if (!entered) {
+                // The search screen (and other overlays) have no browse
+                // tiles to click — Escape back to a browse screen first,
+                // then retry. This is the search → play-result flow.
+                tapKey(webContents, 'Escape')
+                await sleep(900)
+                entered = await enterWatchView(webContents, before)
+                attempts.push({ strategy: 'enter-watch-view-after-escape', matched: entered })
+            }
             if (entered) onWatchView = true
         }
 
