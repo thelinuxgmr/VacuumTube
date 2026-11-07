@@ -867,51 +867,103 @@ function createMcpServer({ getWindow, context }) {
                 await sleep(300)
             }
 
-            // Type the query into the (auto-focused) search field.
-            focusWindow()
-            try {
-                let r = webContents.insertText(q)
-                if (r && typeof r.catch === 'function') r.catch(() => {})
-            } catch (err) { /* older Electron: sync or missing */ }
+            // Type the query on the on-screen keyboard: the search screen
+            // has no text input at all (verified live) — synthetic text
+            // insertion (insertText, char events) never reaches it. What
+            // works is clicking the keyboard's letter keys with trusted
+            // clicks; results then render live as the query grows.
+            let typeLabel = async (label) => {
+                let pt = await evalJS(webContents, `(() => {
+                    for (const el of document.querySelectorAll('YT-KEYBOARD-KEY, [class*="keyboard" i] *')) {
+                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                        }
+                    }
+                    return null
+                })()`.replace('__LABEL__', label)).catch(() => null)
+                if (pt) {
+                    clickPoint(webContents, pt.x, pt.y)
+                    return true
+                }
+                return false
+            }
+            let typed = ''
+            let skipped = ''
+            if (onSearch) {
+                for (let ch of q) {
+                    if (/[a-z]/i.test(ch)) {
+                        if (await typeLabel(ch.toUpperCase())) typed += ch
+                        else skipped += ch
+                    } else if (ch === ' ') {
+                        if (await typeLabel('SPACE')) typed += ' '
+                        else skipped += ch
+                    } else if (/[0-9]/.test(ch)) {
+                        // Digits live behind the &123 keyboard mode.
+                        if (await typeLabel('&123')) {
+                            await sleep(300)
+                            if (await typeLabel(ch)) typed += ch
+                            else skipped += ch
+                            await typeLabel('ABC')
+                        } else {
+                            skipped += ch
+                        }
+                    } else {
+                        skipped += ch
+                    }
+                    await sleep(280)
+                }
+            }
 
-            // Wait for and scrape the results.
+            // Wait for and scrape the results. Search results are not
+            // tiles: they live in YTLR-SEARCH-RESULTS as AVATAR-LOCKUP
+            // items (verified live); fall back to tile-like containers.
             let scrape = async () => await evalJS(webContents, `(() => {
                 const out = []
                 const seen = new Set()
                 const digId = (el) => {
-                    try {
-                        const d = el.data || el.__data
-                        if (d) {
-                            const s = JSON.stringify(d).slice(0, 8000)
-                            const m = s.match(/"videoId":\\s*"([\\w-]{11})"/)
-                            if (m) return m[1]
-                        }
-                    } catch (e) {}
-                    const href = el.getAttribute && (el.getAttribute('href') || el.getAttribute('data-href'))
-                    if (href) {
-                        const m = href.match(/[?&]v=([\\w-]{11})/)
-                        if (m) return m[1]
+                    let node = el
+                    for (let i = 0; i < 3 && node; i++) {
+                        try {
+                            const d = node.data || node.__data
+                            if (d) {
+                                const s = JSON.stringify(d).slice(0, 12000)
+                                const m = s.match(/"videoId":\\s*"([\\w-]{11})"/)
+                                if (m) return m[1]
+                            }
+                        } catch (e) {}
+                        node = node.parentElement
                     }
                     return null
                 }
-                const els = document.querySelectorAll('YTLR-TILE-RENDERER, [class*="tile" i], [class*="result" i], [class*="search-result" i], [data-video-id]')
-                for (const el of els) {
+                const containers = document.querySelectorAll('YTLR-SEARCH-RESULTS')
+                let items = []
+                if (containers.length > 0) {
+                    for (const c of containers) {
+                        items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                    }
+                }
+                if (items.length === 0) {
+                    items = Array.from(document.querySelectorAll('YTLR-TILE-RENDERER'))
+                }
+                for (const el of items) {
                     const r = el.getBoundingClientRect()
-                    if (r.width < 60 || r.height < 40) continue
+                    if (r.width < 40 || r.height < 20) continue
                     const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
                     if (!text) continue
                     const id = digId(el)
                     const key = id || text.slice(0, 60)
                     if (seen.has(key)) continue
                     seen.add(key)
-                    out.push({ id: id, title: text.slice(0, 160) })
+                    const lines = text.split(/(?=\\d+:\\d{2})|(?=LIVE)/)
+                    out.push({ id: id, title: (lines[0] || text).slice(0, 160), detail: text.slice(0, 240) })
                     if (out.length >= 10) break
                 }
                 return out
             })()`).catch(() => [])
 
             let results = []
-            let rDeadline = Date.now() + 9000
+            let rDeadline = Date.now() + 10000
             for (;;) {
                 results = await scrape()
                 if (results.length > 0 || Date.now() >= rDeadline) break
@@ -922,10 +974,12 @@ function createMcpServer({ getWindow, context }) {
             let out = {
                 ok: true,
                 query: q,
+                typedQuery: typed,
                 onSearchScreen: onSearch,
                 results,
                 ...(p ? stateFromProbe(webContents, p) : {})
             }
+            if (skipped) out.skippedCharacters = skipped
             if (results.length === 0) {
                 out.note = 'no results could be scraped from the search page (see pageText for what the TV is showing)'
             }
