@@ -53,6 +53,7 @@ code changes. To revoke an agent, remove its token and restart.
 | `set_volume` | `volume`: 0–100 | Sets playback volume |
 | `navigate_home` | — | Back to the YouTube TV home screen (real Escape key) |
 | `search` | `query`: string, `openChannel`: optional boolean | Opens the TV search screen, **clears any text already in the search box**, types the query on the on-screen keyboard, **submits it with the SEARCH key**, and returns the top 10 results (title + video ID) — but only once they are verified to belong to this query (see below). Channel entries in the results are returned separately in `channels`; with `openChannel: true` the tool also clicks the rendered channel entry and reports the page state it lands on |
+| `open_channel` | `channel`: handle (@AsmonTV), channel ID (UC…), channel URL, or channel name | Navigates the app directly to that channel page and verifies the landing (route / channel header / page text) before returning. Layered strategies, in order: browse-endpoint navigation event (ID known), trusted click on an in-page element whose data references the channel, hash route, then search + a trusted mouse click on the rendered channel entry. **No simulated remote keys** — injected keys demonstrably do not move focus in the search UI. Errors with diagnostics if nothing lands |
 | `back` | `steps`: optional, 1–10 | Returns to a previously watched video (see History) |
 
 ## How control works (learned live — read this before "fixing" navigation)

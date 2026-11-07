@@ -134,6 +134,38 @@ function videoIdFrom(input) {
     return null
 }
 
+// Parse an open_channel argument into what we know how to navigate to:
+// a browseId (UC…) when the caller gave one (directly or via a
+// /channel/UC… URL), a handle (@AsmonTV, bare or via a /@handle URL),
+// or a plain channel/display name (resolved through search).
+function channelTargetFrom(input) {
+    if (!input) return null
+    let str = String(input).trim()
+    if (!str) return null
+
+    if (/^UC[\w-]{22}$/.test(str)) return { browseId: str, handle: null, name: null }
+
+    try {
+        let url = new URL(str)
+        let chan = url.pathname.match(/\/channel\/(UC[\w-]{22})/)
+        if (chan) return { browseId: chan[1], handle: null, name: null }
+        let handle = url.pathname.match(/\/@([\w.-]+)/)
+        if (handle) return { browseId: null, handle: handle[1], name: null }
+        let named = url.pathname.match(/\/(?:user|c)\/([\w.-]+)/)
+        if (named) return { browseId: null, handle: null, name: named[1] }
+    } catch (err) {
+        // not a URL — fall through
+    }
+
+    if (str.startsWith('@')) {
+        let handle = str.slice(1).trim()
+        if (/^[\w.-]+$/.test(handle)) return { browseId: null, handle, name: null }
+    }
+    if (/\s/.test(str)) return { browseId: null, handle: null, name: str }
+    if (/^[\w.-]+$/.test(str)) return { browseId: null, handle: str, name: null }
+    return { browseId: null, handle: null, name: str }
+}
+
 function textResult(obj) {
     return { content: [{ type: 'text', text: JSON.stringify(obj, null, 2) }] }
 }
@@ -1305,6 +1337,279 @@ function createMcpServer({ getWindow, context }) {
                 }
             }
             return textResult(out)
+        })
+
+    register('open_channel',
+        'Navigate VacuumTube directly to a channel page — e.g. open_channel({channel: "@AsmonTV"}), a channel ID (UC…), a channel URL, or a channel name. Uses the app\'s own navigation (browse-endpoint dispatch, in-page endpoint activation, then search + a trusted click on the channel entry) — never simulated remote keys. Verifies the channel page actually loaded before returning.',
+        { channel: z.string().describe('Channel handle (@AsmonTV), channel ID (UC…), channel URL, or channel name') },
+        async ({ channel }) => {
+            let target = channelTargetFrom(channel)
+            if (!target) return errorResult(`Could not parse a channel from: ${channel}`)
+            let webContents = getWebContents()
+            let attempts = []
+
+            let pickerVisible = (p) => {
+                if (!p) return false
+                const t = ((p.pageText || '') + ' ' + (p.dialog || '')).toLowerCase()
+                return t.includes('watch as guest') || t.includes('add account') ||
+                    t.includes("who's watching") || t.includes('who is watching')
+            }
+            let startProbe = await probe(webContents).catch(() => null)
+            if (pickerVisible(startProbe)) {
+                return errorResult('open_channel unavailable: the TV is on the "Who\'s Watching" profile picker — select a profile on the TV first, then retry')
+            }
+
+            // Extra channel-page evidence beyond the standard probe:
+            // the route, a longer page-text slice, and any visible
+            // channel-header element's text.
+            let channelProbe = async () => {
+                let base = await probe(webContents).catch(() => null)
+                let extra = await evalJS(webContents, `(() => {
+                    let headerText = ''
+                    try {
+                        for (const el of document.querySelectorAll('*')) {
+                            const tag = (el.tagName || '').toLowerCase()
+                            if (!tag.includes('channel')) continue
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 100 && r.height > 20) {
+                                const t = (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                                if (t) { headerText = t.slice(0, 300); break }
+                            }
+                        }
+                    } catch (e) {}
+                    let text = ''
+                    try { text = (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 600) } catch (e) {}
+                    return { hash: location.hash || '', headerText, text }
+                })()`).catch(() => null)
+                return { base, extra }
+            }
+            let landed = ({ base, extra }) => {
+                if (!base && !extra) return false
+                let hash = ((extra && extra.hash) || (base && base.hash) || '').toLowerCase()
+                let href = ((base && base.href) || '').toLowerCase()
+                let text = (((extra && extra.text) || '') + ' ' + ((extra && extra.headerText) || '')).toLowerCase()
+                if (hash.includes('/channel/') || href.includes('/channel/')) return true
+                if (target.browseId && (hash.includes(target.browseId.toLowerCase()) || href.includes(target.browseId.toLowerCase()))) return true
+                if (target.handle && (hash.includes(target.handle.toLowerCase()) || text.includes('@' + target.handle.toLowerCase()))) return true
+                if (target.name && text.includes(target.name.toLowerCase())) return true
+                if (extra && extra.headerText) return true
+                return false
+            }
+            let waitForChannel = async (timeoutMs) => {
+                let deadline = Date.now() + timeoutMs
+                let last = await channelProbe()
+                while (!landed(last) && Date.now() < deadline) {
+                    await sleep(400)
+                    last = await channelProbe()
+                }
+                return last
+            }
+            let finish = (cp, strategy) => textResult({
+                ok: true, verified: true, strategy,
+                channel: String(channel),
+                ...(target.browseId ? { browseId: target.browseId } : {}),
+                ...(target.handle ? { handle: target.handle } : {}),
+                attempts,
+                ...(cp.extra ? { channelHeader: cp.extra.headerText || null, pageTextFull: cp.extra.text } : {}),
+                ...(cp.base ? stateFromProbe(webContents, cp.base) : {})
+            })
+
+            // -- Strategy 1: dispatch the app's own navigation event
+            // with a browse endpoint (only possible with a known ID).
+            if (target.browseId) {
+                let fired = await evalJS(webContents, `(() => {
+                    const endpoint = { browseEndpoint: { browseId: ${JSON.stringify(target.browseId)} } }
+                    const detail = { endpoint, browseEndpoint: endpoint.browseEndpoint }
+                    const fired = []
+                    const fire = (node, label) => {
+                        try { node.dispatchEvent(new CustomEvent('yt-navigate', { bubbles: true, composed: true, detail })); fired.push(label) } catch (e) {}
+                        try { node.dispatchEvent(new CustomEvent('yt-navigate-start', { bubbles: true, composed: true, detail })); } catch (e) {}
+                    }
+                    fire(document, 'document')
+                    fire(window, 'window')
+                    const app = document.querySelector('ytlr-app, ytlr-tv')
+                    if (app) fire(app, 'app')
+                    return fired
+                })()`).catch(() => [])
+                attempts.push({ strategy: 'navigate-event', fired })
+                let cp = await waitForChannel(4000)
+                if (landed(cp)) return finish(cp, 'navigate-event')
+
+                // -- Strategy 2: activate an in-page element whose own
+                // data references this browseId (trusted mouse click —
+                // the proven primitive in this app).
+                let pt = await evalJS(webContents, `(() => {
+                    const want = ${JSON.stringify(target.browseId)}
+                    for (const el of document.querySelectorAll('*')) {
+                        let hit = false
+                        try {
+                            const d = el.data || el.__data
+                            if (d && JSON.stringify(d).slice(0, 20000).includes(want)) hit = true
+                        } catch (e) {}
+                        if (!hit) {
+                            const href = el.getAttribute && (el.getAttribute('href') || '')
+                            if (href && href.includes(want)) hit = true
+                        }
+                        if (!hit) continue
+                        const r = el.getBoundingClientRect()
+                        if (r.width > 30 && r.height > 15 && r.bottom > 0 && r.top < innerHeight) {
+                            return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                        }
+                    }
+                    return null
+                })()`).catch(() => null)
+                attempts.push({ strategy: 'endpoint-element-click', found: !!pt })
+                if (pt) {
+                    clickPoint(webContents, pt.x, pt.y)
+                    let cp2 = await waitForChannel(4000)
+                    if (landed(cp2)) return finish(cp2, 'endpoint-element-click')
+                }
+
+                // -- Strategy 3: hash route (the SPA ignored this for
+                // watch pages; cheap to try for channel pages).
+                await evalJS(webContents, `location.hash = ${JSON.stringify('#/channel/' + target.browseId)}; true`).catch(() => {})
+                attempts.push({ strategy: 'hash-route' })
+                let cp3 = await waitForChannel(3000)
+                if (landed(cp3)) return finish(cp3, 'hash-route')
+            }
+
+            // -- Strategy 4: hash route by handle (cheap, same caveat).
+            if (target.handle) {
+                await evalJS(webContents, `location.hash = ${JSON.stringify('#/@' + target.handle)}; true`).catch(() => {})
+                attempts.push({ strategy: 'hash-route-handle' })
+                let cp = await waitForChannel(2500)
+                if (landed(cp)) return finish(cp, 'hash-route-handle')
+            }
+
+            // -- Strategy 5 (primary for handle/name): search for the
+            // channel, then a trusted MOUSE click on the rendered
+            // channel lockup. (Injected remote keys demonstrably do
+            // not move focus in the search UI; mouse clicks are the
+            // primitive that works there.) Compact re-implementation
+            // of the search screen flow — the verified search tool's
+            // closure is not shared, by design.
+            let query = target.name || target.handle || ''
+            if (query) {
+                let before = await probe(webContents).catch(() => null)
+                if (before && before.watchView && before.watchView.active) {
+                    tapKey(webContents, 'Escape')
+                    await sleep(900)
+                }
+                let pill = await evalJS(webContents, `(() => {
+                    const candidates = []
+                    for (const el of document.querySelectorAll('*')) {
+                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'Search') candidates.push(el)
+                    }
+                    for (let el of candidates) {
+                        let node = el
+                        for (let i = 0; i < 4 && node; i++) {
+                            const r = node.getBoundingClientRect()
+                            if (r.width > 100 && r.height > 20) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                            node = node.parentElement
+                        }
+                    }
+                    return null
+                })()`).catch(() => null)
+                if (pill) clickPoint(webContents, pill.x, pill.y)
+                let onSearch = false
+                let sDeadline = Date.now() + 6000
+                while (Date.now() < sDeadline) {
+                    let p = await probe(webContents).catch(() => null)
+                    if (p && (p.hash || '').startsWith('#/search')) { onSearch = true; break }
+                    await sleep(300)
+                }
+                attempts.push({ strategy: 'search-then-click', searchScreenOpened: onSearch })
+                if (onSearch) {
+                    let typeLabel = async (label) => {
+                        let pt = await evalJS(webContents, `(() => {
+                            const kb = document.querySelector('YTLR-SEARCH-KEYBOARD') || document
+                            for (const el of kb.querySelectorAll('*')) {
+                                if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
+                                    const r = el.getBoundingClientRect()
+                                    if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                                }
+                            }
+                            return null
+                        })()`.replace('__LABEL__', label)).catch(() => null)
+                        if (pt) { clickPoint(webContents, pt.x, pt.y); return true }
+                        return false
+                    }
+                    let readBox = async () => await evalJS(webContents, `(() => {
+                        const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
+                        if (!box) return ''
+                        const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
+                        return (t === 'Search') ? '' : t
+                    })()`).catch(() => '')
+                    // Matt's standing rule: CLEAR any pre-existing
+                    // search-box text before typing.
+                    let existing = await readBox()
+                    for (let i = 0; i < 3 && existing; i++) {
+                        await typeLabel('CLEAR')
+                        await sleep(500)
+                        existing = await readBox()
+                    }
+                    let typed = ''
+                    for (let ch of query) {
+                        if (/[a-z]/i.test(ch)) { if (await typeLabel(ch.toUpperCase())) typed += ch }
+                        else if (ch === ' ') { if (await typeLabel('SPACE')) typed += ' ' }
+                        else if (/[0-9]/.test(ch)) {
+                            if (await typeLabel('&123')) {
+                                await sleep(300)
+                                if (await typeLabel(ch)) typed += ch
+                                await typeLabel('ABC')
+                            }
+                        }
+                        await sleep(280)
+                    }
+                    attempts.push({ strategy: 'search-then-click', typed })
+                    if (typed) {
+                        await typeLabel('SEARCH')
+                        await sleep(2500)
+                        // Find the rendered channel entry: a lockup
+                        // whose text carries an @handle, preferring an
+                        // exact handle/name match.
+                        let findLockup = async () => await evalJS(webContents, `(() => {
+                            const wantHandle = ${JSON.stringify(target.handle ? target.handle.toLowerCase() : '')}
+                            const wantName = ${JSON.stringify(target.name ? target.name.toLowerCase() : '')}
+                            let items = []
+                            for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
+                                items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                            }
+                            if (items.length === 0) items = Array.from(document.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
+                            let firstChannel = null
+                            for (const el of items) {
+                                const r = el.getBoundingClientRect()
+                                if (r.width < 40 || r.height < 20) continue
+                                const text = (el.innerText || '').replace(/\\s+/g, ' ').trim()
+                                if (!/@[\\w.]+/.test(text)) continue
+                                const lower = text.toLowerCase()
+                                const pt = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: text.slice(0, 140) }
+                                if ((wantHandle && lower.includes('@' + wantHandle)) || (wantName && lower.includes(wantName))) return pt
+                                if (!firstChannel) firstChannel = pt
+                            }
+                            return firstChannel
+                        })()`).catch(() => null)
+                        let lockup = await findLockup()
+                        if (!lockup) { await sleep(1500); lockup = await findLockup() }
+                        attempts.push({ strategy: 'search-then-click', lockup: lockup ? lockup.text : null })
+                        if (lockup) {
+                            clickPoint(webContents, lockup.x, lockup.y)
+                            let cp = await waitForChannel(6000)
+                            if (landed(cp)) return finish(cp, 'search-then-click')
+                            // A click that opened a video instead of
+                            // the channel is a miss, not a landing.
+                            attempts.push({ strategy: 'search-then-click', landed: false, hash: cp.extra ? cp.extra.hash : null })
+                        }
+                    }
+                }
+            }
+
+            let last = await channelProbe()
+            return errorResult('open_channel could not navigate to "' + String(channel) + '" — no strategy landed on the channel page. Diagnostics: ' + JSON.stringify({
+                target, attempts,
+                ...(last.extra ? { hash: last.extra.hash, channelHeader: last.extra.headerText, pageTextFull: last.extra.text } : {}),
+                ...(last.base ? stateFromProbe(webContents, last.base) : {})
+            }))
         })
 
     register('back',
