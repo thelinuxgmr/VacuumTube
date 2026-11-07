@@ -889,6 +889,28 @@ function createMcpServer({ getWindow, context }) {
                 }
                 return false
             }
+            // Own the search box: if the user (or an earlier search)
+            // left text in it, clear it with the keyboard's CLEAR key
+            // and verify the box is empty before typing — otherwise the
+            // new query would append to and mix with the old text.
+            // (There is no text input element to set programmatically;
+            // CLEAR is the app's own deterministic clear.)
+            let existingQuery = null
+            if (onSearch) {
+                let readBox = async () => await evalJS(webContents, `(() => {
+                    const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
+                    return box ? (box.innerText || '').replace(/\\s+/g, ' ').trim() : ''
+                })()`).catch(() => '')
+                existingQuery = await readBox()
+                var foundQuery = existingQuery
+                for (let attempt = 0; attempt < 3; attempt++) {
+                    if (!existingQuery) break
+                    await typeLabel('CLEAR')
+                    await sleep(500)
+                    existingQuery = await readBox()
+                }
+            }
+
             let typed = ''
             let skipped = ''
             if (onSearch) {
@@ -974,6 +996,8 @@ function createMcpServer({ getWindow, context }) {
                 ok: true,
                 query: q,
                 typedQuery: typed,
+                clearedExistingQuery: (typeof foundQuery !== 'undefined' && foundQuery) ? foundQuery : null,
+                boxEmptyBeforeTyping: existingQuery === '',
                 onSearchScreen: onSearch,
                 resultsForQuery,
                 results,
