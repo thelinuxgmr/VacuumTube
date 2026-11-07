@@ -81,6 +81,17 @@
 // focused element digs to the channel's browseId); then click
 // the avatar and let the rendered-state assertion judge.
 //
+// v3.19: v3.18 failed live with tileVisible:true but both routing
+// witnesses false, and the attempts could not say WHICH link broke
+// (tile click? synthetic Up keys? the focus-based witness?). The
+// routing witness is now the app's own bookkeeping: on a routed
+// watch page the SPA writes #/watch?v=<routedId> into the URL --
+// no keys, no focus, no dig ordering. The tile is clicked via its
+// YTLR-TILE-RENDERER rect (the element play_video clicks
+// successfully), the attempts log the URL after every step, and
+// the info bar is raised before the avatar clicks, whose loop
+// also retries the element point after the wake-up click.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -2019,28 +2030,42 @@ function createMcpServer({ getWindow, context }) {
                 attempts.push({ strategy: 'routed-watch', videoIds: hopIds })
                 let hopVideoId = hopIds[0] || null
                 if (hopVideoId) {
-                    // Witness that the routed watch page is THIS
-                    // channel's: raise the info bar (UP x2 from the
-                    // player controls -- probed live 2026-11-06)
-                    // and read the focused element's browseId.
-                    let routedHere = async () => {
-                        tapKey(webContents, 'Up')
-                        await sleep(600)
-                        tapKey(webContents, 'Up')
-                        await sleep(1200)
-                        let snap = await screenSnapshot(webContents).catch(() => null)
-                        return !!(snap && snap.focused && snap.focused.browseId === hopBrowseId)
-                    }
+                    // Routing witness: the app's own bookkeeping.
+                    // On a routed watch page the SPA writes
+                    // #/watch?v=<routedId> into the URL (it never
+                    // follows player-API switches -- v3.18's
+                    // focus-based witness could not be trusted).
+                    let hrefNow = async () => await evalJS(webContents, 'location.href').catch(() => '')
+                    let routedHere = async () => String(await hrefNow()).includes('#/watch?v=' + hopVideoId)
                     let routed = false
-                    // R1: the video's own tile is on screen now.
-                    let snap0 = await screenSnapshot(webContents).catch(() => null)
-                    let tile = snap0 ? (snap0.items || []).find((i) => i.videoId === hopVideoId) : null
+                    // R1: click the video's own tile (the
+                    // YTLR-TILE-RENDERER element itself -- the one
+                    // play_video clicks successfully).
+                    let tile = await evalJS(webContents, `(() => {
+                        const want = ${JSON.stringify(hopVideoId)}
+                        for (const el of document.querySelectorAll('YTLR-TILE-RENDERER')) {
+                            let hit = false
+                            const nodes = [el, ...el.querySelectorAll('*')]
+                            for (const n of nodes) {
+                                try {
+                                    const d = n.data || n.__data
+                                    if (d && JSON.stringify(d).slice(0, 24000).includes('"videoId":"' + want + '"')) { hit = true; break }
+                                } catch (e) {}
+                            }
+                            if (!hit) continue
+                            const r = el.getBoundingClientRect()
+                            if (r.width > 80 && r.height > 50 && r.bottom > 0 && r.top < innerHeight && r.left < innerWidth) {
+                                return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
+                            }
+                        }
+                        return null
+                    })()`).catch(() => null)
                     attempts.push({ strategy: 'routed-watch', tileVisible: !!tile })
                     if (tile) {
                         clickPoint(webContents, tile.x, tile.y)
-                        await sleep(3000)
+                        await sleep(3500)
                         routed = await routedHere()
-                        attempts.push({ strategy: 'routed-watch', afterTileClick: routed })
+                        attempts.push({ strategy: 'routed-watch', afterTileClick: routed, href: String(await hrefNow()).slice(-60) })
                     }
                     // R2: reload the app on the watch URL -- launch
                     // deep-links route videos (channels are
@@ -2048,13 +2073,21 @@ function createMcpServer({ getWindow, context }) {
                     if (!routed) {
                         await evalJS(webContents, `(() => { try { location.hash = '#/watch?v=${hopVideoId}' } catch (e) {} return true })()`).catch(() => {})
                         await evalJS(webContents, `(() => { setTimeout(() => { try { location.reload() } catch (e) {} }, 300); return true })()`).catch(() => {})
-                        await sleep(8000)
-                        routed = await routedHere()
-                        attempts.push({ strategy: 'routed-watch', afterReload: routed })
+                        for (let i = 0; i < 6 && !routed; i++) {
+                            await sleep(2500)
+                            routed = await routedHere()
+                        }
+                        attempts.push({ strategy: 'routed-watch', afterReload: routed, href: String(await hrefNow()).slice(-60) })
                     }
                     attempts.push({ strategy: 'routed-watch', routed })
                     if (routed) {
                         await pauseAnyMedia()
+                        // Raise the info bar (any key activity wakes
+                        // the watch UI; UP x2 is the probed path).
+                        tapKey(webContents, 'Up')
+                        await sleep(500)
+                        tapKey(webContents, 'Up')
+                        await sleep(1000)
                         // The channel avatar: a small square element
                         // in the info bar (bottom-left, beside the
                         // Description / Subscribe buttons). Fall back
@@ -2076,6 +2109,7 @@ function createMcpServer({ getWindow, context }) {
                         let points = []
                         if (avatar) points.push({ x: avatar.x, y: avatar.y, via: 'avatar-element' })
                         points.push({ x: Math.round(1920 * 0.069), y: Math.round(1080 * 0.718), via: 'avatar-fixed' })
+                        if (avatar) points.push({ x: avatar.x, y: avatar.y, via: 'avatar-element-retry' })
                         for (const p of points) {
                             clickPoint(webContents, p.x, p.y)
                             attempts.push({ strategy: 'routed-watch', avatarClick: p.via, x: p.x, y: p.y })
