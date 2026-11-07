@@ -1060,7 +1060,7 @@ function createMcpServer({ getWindow, context }) {
         })
 
     register('get_state',
-        'Report what VacuumTube is currently doing: the current video (from the player API — the URL does not follow programmatic switches), video state (paused, position, duration, volume), whether the watch screen is showing, a short page hint for diagnosing problems, and the recent watch history (id, title, when it started) used by back().',
+        'Report what VacuumTube is currently doing: the current video (from the player API — the URL does not follow programmatic switches), video state (paused, position, duration, volume), whether the watch screen is showing, a short page hint for diagnosing problems, the rendered page type (screenPage) and focused element from the screen readout, and the recent watch history (id, title, when it started) used by back(). For the full rendered snapshot — visible items with their targets — use get_screen.',
         {},
         async () => {
             let webContents = getWebContents()
