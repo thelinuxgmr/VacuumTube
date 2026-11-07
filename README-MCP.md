@@ -46,14 +46,17 @@ code changes. To revoke an agent, remove its token and restart.
 | Tool | Arguments | What it does |
 | --- | --- | --- |
 | `play_video` | `video`: video ID or YouTube URL | Plays that video on the watch screen via the app's own player API. **Verifies** the switch before returning (see below) |
-| `get_state` | — | The current video **from the player API** (the URL does not follow programmatic switches), video state, whether the watch screen is actually showing, the player-API volume, a short page hint, and the recent watch history |
+| `get_state` | — | The current video **from the player API** (the URL does not follow programmatic switches), video state, whether the watch screen is actually showing, the player-API volume, a short page hint, the rendered page type (`screenPage`), and the recent watch history |
+| `get_screen` | — | The "eyes": a structured snapshot of what is **actually rendered** — page type (browse / search / watch / channel / account-picker) classified from rendered evidence, the channel header identity on channel pages, the focused element, the search-box text, and the visible items **with their actionable targets** (video IDs, channel handles/browse IDs, durations, click positions). The ground truth other tools verify against |
 | `play` | — | Resumes playback |
 | `pause` | — | Pauses playback |
 | `seek` | `seconds`: number | Seeks to an absolute position |
 | `set_volume` | `volume`: 0–100 | Sets playback volume |
 | `navigate_home` | — | Back to the YouTube TV home screen (real Escape key) |
 | `search` | `query`: string, `openChannel`: optional boolean | Opens the TV search screen, **clears any text already in the search box**, types the query on the on-screen keyboard, **submits it with the SEARCH key**, and returns the top 10 results (title + video ID) — but only once they are verified to belong to this query (see below). Channel entries in the results are returned separately in `channels`; with `openChannel: true` the tool also clicks the rendered channel entry and reports the page state it lands on |
-| `open_channel` | `channel`: handle (@AsmonTV), channel ID (UC…), channel URL, or channel name | Navigates the app directly to that channel page and verifies the landing (route / channel header / page text) before returning. Layered strategies, in order: browse-endpoint navigation event (ID known), trusted click on an in-page element whose data references the channel, hash route, then search + a trusted mouse click on the rendered channel entry. **No simulated remote keys** — injected keys demonstrably do not move focus in the search UI. Errors with diagnostics if nothing lands |
+| `open_channel` | `channel`: creator name/alias, handle (@AsmonTV), channel ID (UC…), or channel URL | Navigates the app to that channel page and verifies the landing **against the rendered screen** (page type + channel header identity + that channel's videos on screen) before returning — route strings are never accepted as proof. Strategies, in order: trusted click on the watch page's channel byline (video → its channel), trusted click on the smallest in-page element whose data references the channel (subscribe buttons excluded), the app's browse-endpoint navigation event, then search + a trusted mouse click on the rendered channel entry. **No hash routes** (the SPA ignores them; v1 "verified" against a hash it had just written itself) and **no simulated remote keys**. Errors with a screen digest if nothing lands |
+| `channel_uploads` | `channel`, optional `limit` (1–30, default 10) | A channel's uploads as rendered on its channel page (Videos tab when one is shown), newest first: title, video ID, duration, age text, Shorts flag. The collection half of "play what <creator> posted today" |
+| `latest_video` | `channel`, optional `play` (boolean) | That channel's newest regular upload (title, video ID, duration) resolved **inside the app in one call** — no web lookup. Skips Shorts. With `play: true`, also plays it (verified like `play_video`) |
 | `back` | `steps`: optional, 1–10 | Returns to a previously watched video (see History) |
 
 ## How control works (learned live — read this before "fixing" navigation)
@@ -123,7 +126,8 @@ and pairing each ID with the title of the *same* item object. If
 nothing verifies in time, the tool returns an error with diagnostics
 instead of plausible-looking wrong results. `resultsFresh` in the
 output says which path verified (`true`, `"visible-verified"`, or
-`"rendered"`).
+`"rendered"`). v3.13 adds the rendered-state binding described above
+and reports the final rendered page type as `screenPage`.
 
 `get_state` probes **all** `<video>` elements and reports the active one
 (largest/loaded/playing), plus the watch-screen rect (`watchView.active`
@@ -134,6 +138,63 @@ pickers, sign-in prompts) from the tool output. One known wrinkle:
 `videoTitle` reflects the app's routed video, so right after an
 API-driven switch it can lag one video behind; IDs and timestamps in
 the history are always exact.
+
+## Screen readout & rendered-state verification (v3.13)
+
+Phase 2's foundation is `get_screen`: a structured snapshot of the
+rendered page — its type, the channel header's identity when on a
+channel page, the focused element, the search-box text, and the
+visible items, each with the target dug out of **that item's own data
+subtree** (video ID / channel browse ID / handle, plus duration, age
+text, and click position). Tools no longer trust intentions:
+
+- `open_channel` returns success only when the rendered page **is**
+  the target's channel page: page type `channel`, a header whose
+  name/handle/browse ID matches the target, and that channel's videos
+  on screen. A route pointing at a *different* channel vetoes the
+  match (stale routes from earlier navigations are real). The v3.9
+  version checked the URL hash — which its own hash-route strategy
+  had just written — and reported `verified` while the TV kept
+  showing a stale search screen (live, three times, 2026-11-06).
+  Hash-route strategies are deleted, not just distrusted.
+- `search` keeps its fingerprint verification (below) and adds a
+  **rendered-state binding**: when the on-screen items' IDs are
+  readable, a data-store candidate sharing no ID with the rendered
+  items is rejected outright.
+- Navigation uses the app's own mechanisms only: trusted clicks on
+  elements carrying the channel's browse endpoint (the watch page's
+  channel byline; channel tiles on browse screens — subscribe buttons
+  are explicitly excluded, their data carries the ID too), the app's
+  navigation event, and — for handles/names — search followed by a
+  trusted click on the rendered channel entry. Creator names and
+  Matt's dictation aliases resolve through a baked-in creator table
+  (`CREATORS` in `src/mcp/server.js`, mirrored from `CREATORS.md`):
+  "Asmongold" / "Aspen Gold" → Asmongold TV (@AsmonTV), "minus tech
+  tips" → Linus Tech Tips, and so on.
+
+## Latest video, channel uploads, and the play queue
+
+`latest_video` and `channel_uploads` resolve uploads from the
+channel's own page inside the app: land via the verified
+`open_channel` path, activate the **Videos** tab when one is rendered
+(its list is newest-first; the channel home leads with featured
+content), and read the uploads off the screen readout. Durations are
+parsed from the rendered labels; items whose data carries a Shorts
+(reel) endpoint are flagged `isShort`, and `latest_video` skips them.
+
+`play_queue` ("play everything <creator> posted today", CREATORS.md
+feature 3) is **designed, not built** — the collection half exists
+(`channel_uploads` returns title/ID/duration/age text; "today" =
+items whose age text is in minutes/hours, played oldest → newest).
+The playback half needs state the current tools deliberately don't
+have yet: a queue in the server context `{channel, videoIds, index}`,
+an advance hook in the existing 4-second observer (when the player
+reports `ended` or the current video leaves the queue head, load the
+next ID via `playVideoCore`), and clear-on-manual-navigation
+semantics (any `play_video`/`back`/manual switch outside the queue
+clears it, mirroring how the observer already distinguishes
+MCP-caused switches). It should ship only after `latest_video` has
+passed live acceptance, since it builds on the same readout.
 
 ## History & back()
 
@@ -170,3 +231,16 @@ curl -s http://127.0.0.1:8977/mcp \
   -H 'Accept: application/json, text/event-stream' \
   -d '{"jsonrpc":"2.0","id":1,"method":"tools/list"}'
 ```
+
+## Acceptance self-test (after a deploy)
+
+`tools/selftest.py` runs the full acceptance matrix — search two
+creators + a topic ("Taiwan travel"), open_channel, latest_video +
+play_video, a second play, back, navigate_home — asserting the
+**rendered** state via `get_screen` at each step. Run it in a
+TV-free window right after deploying; a full run takes a few minutes
+(the tools type/click at human pace). The server binds localhost on
+the TV, so run it on the TV itself or through an SSH tunnel
+(`ssh -L 8977:127.0.0.1:8977 tv@bazzite`). Token via `--token`,
+`--token-file`, or `$VACUUMTUBE_MCP_TOKEN`; see the script's
+docstring.
