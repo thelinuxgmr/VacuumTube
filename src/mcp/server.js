@@ -3,7 +3,8 @@
 // An optional, token-gated MCP (Model Context Protocol) server that runs in
 // the Electron main process and exposes a small set of high-level tools so an
 // AI agent can control playback directly ("play this video", "what's
-// playing?", "pause") instead of simulating remote-control button presses.
+// playing?", "pause", "go back to what I was watching") instead of
+// simulating remote-control button presses.
 //
 // - Transport: MCP Streamable HTTP, stateless, JSON responses.
 // - Binds to 127.0.0.1 ONLY. It is meant to be reached locally, or through a
@@ -18,6 +19,14 @@
 //   If no tokens are configured, the server does not start at all and the
 //   app behaves exactly like upstream VacuumTube.
 // - Port: VACUUMTUBE_MCP_PORT env var, default 8977. Path: /mcp.
+// - Page scripts run with a timeout (VACUUMTUBE_MCP_JS_TIMEOUT_MS env var,
+//   default 5000) so a wedged page can never hang a tool call.
+// - Watch history is kept in `mcp-history.json` in userData: the videos that
+//   were played (id, title when the page exposes it, and when playback
+//   started), newest last. It powers the back() tool and is included in
+//   get_state so an agent can resolve "the video I was watching 20 minutes
+//   ago". Videos started by hand are recorded too (a light poller watches
+//   for video changes).
 //
 // See README-MCP.md (repo root) for setup and client configuration.
 
@@ -35,6 +44,17 @@ const youtubeUrl = 'https://www.youtube.com/tv'
 // the User-Agent header for youtube.com requests anyway; this keeps direct
 // navigations consistent.
 const youtubeClientUserAgent = `Mozilla/5.0 (PS4; Leanback Shell) Cobalt/19.lts.0-qa; compatible; VacuumTube/${package.version}`
+
+const JS_TIMEOUT_MS = (() => {
+    let n = parseInt(process.env.VACUUMTUBE_MCP_JS_TIMEOUT_MS, 10)
+    return (isFinite(n) && n > 0) ? n : 5000
+})()
+
+const HISTORY_LIMIT = 50
+
+function sleep(ms) {
+    return new Promise(resolve => setTimeout(resolve, ms))
+}
 
 function loadTokens(userData) {
     let tokens = []
@@ -106,7 +126,280 @@ function errorResult(message) {
     return { content: [{ type: 'text', text: String(message) }], isError: true }
 }
 
-function createMcpServer({ getWindow }) {
+// ---------------------------------------------------------------------------
+// Page access helpers
+// ---------------------------------------------------------------------------
+
+// Run a script in the page, but never wait longer than timeoutMs for it.
+// (The script itself may still complete in the page afterwards; the tool
+// just stops waiting. Media play() promises in particular can pend forever
+// on an unloaded element, which hung a v1 tool call for 30s.)
+function evalJS(webContents, code, timeoutMs = JS_TIMEOUT_MS) {
+    return new Promise((resolve, reject) => {
+        let done = false
+        let timer = setTimeout(() => {
+            if (!done) {
+                done = true
+                reject(new Error(`page script timed out after ${timeoutMs}ms`))
+            }
+        }, timeoutMs)
+        Promise.resolve()
+            .then(() => webContents.executeJavaScript(code))
+            .then(value => {
+                if (!done) { done = true; clearTimeout(timer); resolve(value) }
+            })
+            .catch(err => {
+                if (!done) { done = true; clearTimeout(timer); reject(err) }
+            })
+    })
+}
+
+// One probe of the page: every <video> element, the best guess at the active
+// one, the watch-route video id, a best-effort video title, and a compact
+// page hint (first visible text + any visible dialog) so failures like an
+// interstitial screen are diagnosable from the tool output alone.
+const PROBE_JS = `(() => {
+    const idFromHash = () => {
+        const m = (location.hash || '').match(/[?&]v=([\\w-]{11})/)
+        return m ? m[1] : null
+    }
+    const describe = (v, i) => {
+        let width = 0, height = 0
+        try {
+            const r = v.getBoundingClientRect()
+            width = Math.round(r.width); height = Math.round(r.height)
+        } catch (e) {}
+        return {
+            index: i,
+            paused: v.paused,
+            ended: v.ended,
+            currentTime: v.currentTime,
+            duration: (typeof v.duration === 'number' && isFinite(v.duration)) ? v.duration : null,
+            readyState: v.readyState,
+            volume: v.volume,
+            muted: v.muted,
+            currentSrc: v.currentSrc || null,
+            width, height
+        }
+    }
+    const vids = Array.from(document.querySelectorAll('video')).map(describe)
+    const score = x => (x.currentSrc ? 8 : 0) + x.readyState * 2 +
+        Math.min(4, (x.width * x.height) / 200000) + (x.duration ? 2 : 0) + (!x.paused ? 1 : 0)
+    let active = null, bestScore = -1
+    for (const x of vids) {
+        const s = score(x)
+        if (s > bestScore) { bestScore = s; active = x }
+    }
+
+    let videoTitle = null
+    try {
+        const md = navigator.mediaSession && navigator.mediaSession.metadata
+        if (md && md.title) videoTitle = String(md.title)
+    } catch (e) {}
+    if (!videoTitle) {
+        const sels = ['.ytlr-watch-metadata__title', '[class*="watch-metadata"] [class*="title"]', 'h1']
+        for (const s of sels) {
+            try {
+                const el = document.querySelector(s)
+                if (el && el.textContent && el.textContent.trim()) { videoTitle = el.textContent.trim().slice(0, 200); break }
+            } catch (e) {}
+        }
+    }
+
+    let pageText = ''
+    try { pageText = (document.body.innerText || '').replace(/\\s+/g, ' ').trim().slice(0, 200) } catch (e) {}
+
+    let dialog = null
+    try {
+        const els = document.querySelectorAll('[role="dialog"], [role="alertdialog"]')
+        for (const el of els) {
+            const r = el.getBoundingClientRect()
+            if (r.width > 0 && r.height > 0) {
+                dialog = (el.innerText || el.textContent || '').replace(/\\s+/g, ' ').trim().slice(0, 120) || true
+                break
+            }
+        }
+    } catch (e) {}
+
+    return {
+        href: location.href,
+        hash: location.hash,
+        watchId: idFromHash(),
+        title: document.title,
+        videoTitle: videoTitle,
+        videoCount: vids.length,
+        videos: vids,
+        video: active,
+        pageText: pageText,
+        dialog: dialog
+    }
+})()`
+
+// Picks the same "active" video element the probe reports, for the
+// transport tools (play/pause/seek/volume) to act on.
+const PICK_VIDEO_JS = `(() => {
+    const vids = Array.from(document.querySelectorAll('video'))
+    const score = v => {
+        let area = 0
+        try { const r = v.getBoundingClientRect(); area = r.width * r.height } catch (e) {}
+        return (v.currentSrc ? 8 : 0) + v.readyState * 2 + Math.min(4, area / 200000) +
+            ((typeof v.duration === 'number' && isFinite(v.duration)) ? 2 : 0) + (!v.paused ? 1 : 0)
+    }
+    let best = null, bestScore = -1
+    for (const v of vids) {
+        const s = score(v)
+        if (s > bestScore) { bestScore = s; best = v }
+    }
+    return best
+})()`
+
+async function probe(webContents) {
+    return await evalJS(webContents, PROBE_JS)
+}
+
+function stateFromProbe(webContents, p) {
+    let out = {
+        ok: true,
+        url: webContents.getURL(),
+        href: p.href,
+        title: p.title,
+        video: p.video || null
+    }
+    if (p.watchId) out.watchId = p.watchId
+    if (p.videoTitle) out.videoTitle = p.videoTitle
+    if (p.videoCount > 1) out.videos = p.videos
+    if (p.pageText) out.pageText = p.pageText
+    if (p.dialog) out.dialog = p.dialog
+    return out
+}
+
+// Does this probe show the target video actually loaded as media?
+// watchId alone is not enough: v1 changed the route while the old media
+// kept playing, and after restarts it created elements that never loaded.
+// A match needs the route id, real metadata (duration), a media source,
+// and — when switching away from another video — a *different* media source
+// than the one that was playing before.
+function probeMatchesTarget(p, id, oldBlob) {
+    if (!p || p.watchId !== id || !p.video) return false
+    let v = p.video
+    if (v.duration == null || !v.currentSrc) return false
+    if (oldBlob && v.currentSrc === oldBlob) return false
+    return true
+}
+
+async function waitForVideo(webContents, id, { timeoutMs = 10000, oldBlob = null } = {}) {
+    let deadline = Date.now() + timeoutMs
+    let last = null
+    for (;;) {
+        try {
+            last = await probe(webContents)
+        } catch (err) {
+            last = null
+        }
+        if (last && probeMatchesTarget(last, id, oldBlob)) {
+            return { matched: true, probe: last }
+        }
+        if (Date.now() >= deadline) break
+        await sleep(Math.min(400, Math.max(40, deadline - Date.now())))
+    }
+    // One last snapshot for the report if probing works at all.
+    if (!last) {
+        try { last = await probe(webContents) } catch (err) { /* keep null */ }
+    }
+    return { matched: false, probe: last }
+}
+
+// ---------------------------------------------------------------------------
+// Watch history (powers back(); persisted in userData)
+// ---------------------------------------------------------------------------
+
+function createHistory(userData) {
+    let file = userData ? path.join(userData, 'mcp-history.json') : null
+    let entries = []
+
+    if (file) {
+        try {
+            if (fs.existsSync(file)) {
+                let parsed = JSON.parse(fs.readFileSync(file, 'utf-8'))
+                let list = Array.isArray(parsed) ? parsed : parsed.entries
+                if (Array.isArray(list)) {
+                    entries = list
+                        .filter(e => e && /^[\w-]{11}$/.test(e.id || ''))
+                        .map(e => ({
+                            id: e.id,
+                            title: e.title || undefined,
+                            startedAt: typeof e.startedAt === 'number' ? e.startedAt : undefined
+                        }))
+                        .slice(-HISTORY_LIMIT)
+                }
+            }
+        } catch (err) {
+            console.error('[mcp] failed to read history file', err)
+            entries = []
+        }
+    }
+
+    function save() {
+        if (!file) return
+        try {
+            fs.writeFileSync(file, JSON.stringify({ entries }, null, 2))
+        } catch (err) {
+            console.error('[mcp] failed to write history file', err)
+        }
+    }
+
+    return {
+        list() {
+            return entries.slice()
+        },
+        // Record that a video was left behind (it started at startedAt).
+        // Consecutive duplicates are merged so the MCP tools and the
+        // observation poller don't double-record the same transition.
+        push(entry) {
+            if (!entry || !/^[\w-]{11}$/.test(entry.id || '')) return
+            let last = entries[entries.length - 1]
+            if (last && last.id === entry.id) {
+                if (!last.title && entry.title) last.title = entry.title
+                if (!last.startedAt && entry.startedAt) last.startedAt = entry.startedAt
+                save()
+                return
+            }
+            entries.push({
+                id: entry.id,
+                title: entry.title || undefined,
+                startedAt: entry.startedAt || Date.now()
+            })
+            if (entries.length > HISTORY_LIMIT) entries = entries.slice(-HISTORY_LIMIT)
+            save()
+        },
+        // Remove and return the entry `steps` back from the top of the
+        // stack, skipping (and dropping) entries for the video that is
+        // currently on screen.
+        popBack(currentId, steps = 1) {
+            let seen = 0
+            for (let i = entries.length - 1; i >= 0; i--) {
+                if (currentId && entries[i].id === currentId) {
+                    entries.splice(i, 1)
+                    continue
+                }
+                seen++
+                if (seen === steps) {
+                    let [entry] = entries.splice(i, 1)
+                    save()
+                    return entry
+                }
+            }
+            save()
+            return null
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// MCP server
+// ---------------------------------------------------------------------------
+
+function createMcpServer({ getWindow, context }) {
     const { McpServer } = require('@modelcontextprotocol/sdk/server/mcp.js')
     const { z } = require('zod')
 
@@ -139,48 +432,145 @@ function createMcpServer({ getWindow }) {
         }
     }
 
+    // Core navigation used by play_video and back(). Tries increasingly
+    // forceful strategies, verifying against the page after each one —
+    // a bare route change is NOT success (that was the v1 bug: the hash
+    // changed while the old video kept playing, or a fresh element was
+    // created that never loaded).
+    async function playVideoCore(id, { record = true } = {}) {
+        let webContents = getWebContents()
+
+        let before = null
+        try { before = await probe(webContents) } catch (err) { /* page may be mid-load */ }
+        let fromId = before ? before.watchId : null
+        let fromTitle = before ? before.videoTitle : null
+        let oldBlob = (before && before.video) ? before.video.currentSrc : null
+        let switching = !!(fromId && fromId !== id)
+
+        if (switching && record) {
+            let observed = context.observed
+            context.history.push({
+                id: fromId,
+                title: fromTitle || (observed && observed.id === fromId ? observed.title : undefined),
+                startedAt: (observed && observed.id === fromId) ? observed.startedAt : undefined
+            })
+        }
+        context.lastMcpNavAt = Date.now()
+        context.lastMcpNavTarget = id
+
+        if (fromId === id && before && before.video && before.video.duration != null) {
+            // Already on this video — just make sure it is playing.
+            await evalJS(webContents, `(() => {
+                const v = ${PICK_VIDEO_JS}
+                if (v && v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}) }
+                return true
+            })()`).catch(() => {})
+            await sleep(300)
+            let now = await probe(webContents).catch(() => before)
+            return { ok: true, verified: true, strategy: 'already-playing', videoId: id, ...stateFromProbe(webContents, now) }
+        }
+
+        let matchBlob = switching ? oldBlob : null
+        let attempts = []
+        let tryWait = async (name, ms) => {
+            let r = await waitForVideo(webContents, id, { timeoutMs: ms, oldBlob: matchBlob })
+            attempts.push({ strategy: name, matched: r.matched })
+            return r
+        }
+        let finish = async (r, strategy) => {
+            // Nudge autoplay if the element loaded paused; never await the
+            // media promise (it can pend forever).
+            if (r.probe && r.probe.video && r.probe.video.paused) {
+                await evalJS(webContents, `(() => {
+                    const v = ${PICK_VIDEO_JS}
+                    if (v && v.paused) { const p = v.play(); if (p && p.catch) p.catch(() => {}) }
+                    return true
+                })()`).catch(() => {})
+                await sleep(400)
+                let fresh = await probe(webContents).catch(() => null)
+                if (fresh) r = { matched: true, probe: fresh }
+            }
+            return { ok: true, verified: true, strategy, videoId: id, ...stateFromProbe(webContents, r.probe) }
+        }
+
+        let onTv = webContents.getURL().startsWith(youtubeUrl)
+        let watchHash = `#/watch?v=${id}`
+
+        // Strategy 1: in-page hash navigation (what the SPA is built for).
+        if (onTv) {
+            await evalJS(webContents, `location.hash = ${JSON.stringify(watchHash)}; true`).catch(() => {})
+            let r = await tryWait('hash', 6000)
+            if (r.matched) return await finish(r, 'hash')
+        } else {
+            await webContents.loadURL(`${youtubeUrl}${watchHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+            let r = await tryWait('loadurl', 10000)
+            if (r.matched) return await finish(r, 'loadurl')
+        }
+
+        // Strategy 2: pushState + explicit hashchange/popstate events, in
+        // case the router only listens for its own history transitions.
+        await evalJS(webContents, `(() => {
+            try {
+                history.pushState(null, '', ${JSON.stringify(watchHash)})
+                window.dispatchEvent(new HashChangeEvent('hashchange'))
+                window.dispatchEvent(new PopStateEvent('popstate'))
+            } catch (e) {}
+            return true
+        })()`).catch(() => {})
+        {
+            let r = await tryWait('pushstate', 5000)
+            if (r.matched) return await finish(r, 'pushstate')
+        }
+
+        // Strategy 3: route home first (a clean SPA state), settle, then
+        // hash to the video.
+        await evalJS(webContents, `location.hash = '#/'; true`).catch(() => {})
+        await sleep(1500)
+        await evalJS(webContents, `location.hash = ${JSON.stringify(watchHash)}; true`).catch(() => {})
+        {
+            let r = await tryWait('home-then-hash', 8000)
+            if (r.matched) return await finish(r, 'home-then-hash')
+        }
+
+        // Strategy 4: full reload with the app booting at the watch route.
+        await webContents.loadURL(`${youtubeUrl}${watchHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+        webContents.reload()
+        {
+            let r = await tryWait('reload', 15000)
+            if (r.matched) return await finish(r, 'reload')
+        }
+
+        let last = null
+        try { last = await probe(webContents) } catch (err) { /* ignore */ }
+        return {
+            ok: false,
+            verified: false,
+            videoId: id,
+            attempts,
+            error: 'the video did not start playing after trying hash, pushState, home-then-hash and reload navigation — see the returned page state',
+            ...(last ? stateFromProbe(webContents, last) : {})
+        }
+    }
+
     register('play_video',
-        'Navigate VacuumTube to a YouTube video and start playing it. Accepts a video ID or any YouTube watch/share URL.',
+        'Navigate VacuumTube to a YouTube video and start playing it. Accepts a video ID or any YouTube watch/share URL. Verifies the switch actually happened before returning.',
         { video: z.string().describe('YouTube video ID or URL') },
         async ({ video }) => {
             let id = videoIdFrom(video)
             if (!id) return errorResult(`Could not extract a YouTube video ID from: ${video}`)
-
-            let webContents = getWebContents()
-            let watchHash = `#/watch?v=${id}`
-
-            if (webContents.getURL().startsWith(youtubeUrl)) {
-                await webContents.executeJavaScript(`location.hash = ${JSON.stringify(watchHash)}; true`)
-            } else {
-                await webContents.loadURL(`${youtubeUrl}${watchHash}`, { userAgent: youtubeClientUserAgent })
-            }
-
-            return textResult({ ok: true, videoId: id, url: `${youtubeUrl}${watchHash}` })
+            let result = await playVideoCore(id, { record: true })
+            return textResult(result)
         })
 
     register('get_state',
-        'Report what VacuumTube is currently doing: current URL, page title, and the video element state (paused, position, duration, volume) if a video is loaded.',
+        'Report what VacuumTube is currently doing: current URL, video state (paused, position, duration, volume), a short page hint for diagnosing problems, and the recent watch history (id, title, when it started) used by back().',
         {},
         async () => {
             let webContents = getWebContents()
-            let state = await webContents.executeJavaScript(`(() => {
-                const v = document.querySelector('video')
-                return {
-                    href: location.href,
-                    title: document.title,
-                    video: v ? {
-                        paused: v.paused,
-                        ended: v.ended,
-                        currentTime: v.currentTime,
-                        duration: (typeof v.duration === 'number' && isFinite(v.duration)) ? v.duration : null,
-                        readyState: v.readyState,
-                        volume: v.volume,
-                        muted: v.muted,
-                        currentSrc: v.currentSrc || null
-                    } : null
-                }
-            })()`)
-            return textResult({ ok: true, url: webContents.getURL(), ...state })
+            let p = await probe(webContents)
+            let out = stateFromProbe(webContents, p)
+            out.history = context.history.list().slice(-10)
+            return textResult(out)
         })
 
     register('play',
@@ -188,17 +578,16 @@ function createMcpServer({ getWindow }) {
         {},
         async () => {
             let webContents = getWebContents()
-            let result = await webContents.executeJavaScript(`(async () => {
-                const v = document.querySelector('video')
-                if (!v) return { ok: false, error: 'no video element on the page' }
-                try {
-                    await v.play()
-                    return { ok: true, paused: v.paused }
-                } catch (e) {
-                    return { ok: false, error: String((e && e.message) || e) }
-                }
+            await evalJS(webContents, `(() => {
+                const v = ${PICK_VIDEO_JS}
+                if (!v) return false
+                const p = v.play()
+                if (p && p.catch) p.catch(() => {})
+                return true
             })()`)
-            return result && result.ok ? textResult(result) : errorResult(result ? result.error : 'play failed')
+            await sleep(300)
+            let p = await probe(webContents)
+            return textResult(stateFromProbe(webContents, p))
         })
 
     register('pause',
@@ -206,45 +595,48 @@ function createMcpServer({ getWindow }) {
         {},
         async () => {
             let webContents = getWebContents()
-            let result = await webContents.executeJavaScript(`(() => {
-                const v = document.querySelector('video')
-                if (!v) return { ok: false, error: 'no video element on the page' }
-                v.pause()
-                return { ok: true, paused: v.paused }
+            await evalJS(webContents, `(() => {
+                const v = ${PICK_VIDEO_JS}
+                if (v) v.pause()
+                return !!v
             })()`)
-            return result && result.ok ? textResult(result) : errorResult(result ? result.error : 'pause failed')
+            let p = await probe(webContents)
+            return textResult(stateFromProbe(webContents, p))
         })
 
     register('seek',
         'Seek the current video to an absolute position, in seconds.',
         { seconds: z.number().describe('Absolute position in seconds') },
         async ({ seconds }) => {
-            let webContents = getWebContents()
             let target = Number(seconds)
             if (!isFinite(target) || target < 0) return errorResult(`Invalid seek position: ${seconds}`)
-            let result = await webContents.executeJavaScript(`(() => {
-                const v = document.querySelector('video')
-                if (!v) return { ok: false, error: 'no video element on the page' }
-                v.currentTime = ${JSON.stringify(target)}
-                return { ok: true, currentTime: v.currentTime }
+            let webContents = getWebContents()
+            await evalJS(webContents, `(() => {
+                const v = ${PICK_VIDEO_JS}
+                if (v) v.currentTime = ${JSON.stringify(target)}
+                return !!v
             })()`)
-            return result && result.ok ? textResult(result) : errorResult(result ? result.error : 'seek failed')
+            await sleep(250)
+            let p = await probe(webContents)
+            return textResult(stateFromProbe(webContents, p))
         })
 
     register('set_volume',
         'Set playback volume from 0 (muted) to 100 (full).',
         { volume: z.number().min(0).max(100).describe('Volume 0-100') },
         async ({ volume }) => {
-            let webContents = getWebContents()
             let level = Math.max(0, Math.min(100, Number(volume))) / 100
-            let result = await webContents.executeJavaScript(`(() => {
-                const v = document.querySelector('video')
-                if (!v) return { ok: false, error: 'no video element on the page' }
-                v.volume = ${JSON.stringify(level)}
-                if (${JSON.stringify(level)} > 0) v.muted = false
-                return { ok: true, volume: v.volume, muted: v.muted }
+            let webContents = getWebContents()
+            await evalJS(webContents, `(() => {
+                const v = ${PICK_VIDEO_JS}
+                if (v) {
+                    v.volume = ${JSON.stringify(level)}
+                    if (${JSON.stringify(level)} > 0) v.muted = false
+                }
+                return !!v
             })()`)
-            return result && result.ok ? textResult(result) : errorResult(result ? result.error : 'set_volume failed')
+            let p = await probe(webContents)
+            return textResult(stateFromProbe(webContents, p))
         })
 
     register('navigate_home',
@@ -253,14 +645,137 @@ function createMcpServer({ getWindow }) {
         async () => {
             let webContents = getWebContents()
             if (webContents.getURL().startsWith(youtubeUrl)) {
-                await webContents.executeJavaScript(`location.hash = '#/'; true`)
+                await evalJS(webContents, `location.hash = '#/'; true`).catch(() => {})
             } else {
                 await webContents.loadURL(youtubeUrl, { userAgent: youtubeClientUserAgent })
             }
-            return textResult({ ok: true, url: youtubeUrl })
+            await sleep(600)
+            let p = await probe(webContents).catch(() => null)
+            return textResult(p ? stateFromProbe(webContents, p) : { ok: true, url: youtubeUrl })
+        })
+
+    register('search',
+        'Open the YouTube TV search screen for a query. Returns the top results (title + video ID) scraped from the page when possible; otherwise returns the page state so the caller can see what the TV is showing.',
+        { query: z.string().describe('Search query') },
+        async ({ query }) => {
+            let q = String(query || '').trim()
+            if (!q) return errorResult('search query is empty')
+            let webContents = getWebContents()
+            let searchHash = `#/search?q=${encodeURIComponent(q)}`
+
+            if (webContents.getURL().startsWith(youtubeUrl)) {
+                await evalJS(webContents, `location.hash = ${JSON.stringify(searchHash)}; true`).catch(() => {})
+            } else {
+                await webContents.loadURL(`${youtubeUrl}${searchHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+            }
+
+            // Give the SPA time to render results; scrape what we can.
+            let scrape = async () => await evalJS(webContents, `(() => {
+                const out = []
+                const seen = new Set()
+                const els = document.querySelectorAll('a[href*="v="], [data-href*="v="], [href*="v="]')
+                for (const el of els) {
+                    const href = el.getAttribute('href') || el.getAttribute('data-href') || ''
+                    const m = href.match(/[?&]v=([\\w-]{11})/)
+                    if (!m || seen.has(m[1])) continue
+                    let title = (el.getAttribute('aria-label') || el.textContent || '').replace(/\\s+/g, ' ').trim()
+                    if (!title) {
+                        const img = el.querySelector('img')
+                        if (img) title = (img.getAttribute('alt') || '').trim()
+                    }
+                    seen.add(m[1])
+                    out.push({ id: m[1], title: title.slice(0, 160) || null })
+                    if (out.length >= 10) break
+                }
+                return out
+            })()`).catch(() => [])
+
+            let results = []
+            let deadline = Date.now() + 9000
+            for (;;) {
+                results = await scrape()
+                if (results.length > 0 || Date.now() >= deadline) break
+                // If we are clearly not on a search screen yet, re-assert
+                // the route once via a full load.
+                let p = await probe(webContents).catch(() => null)
+                if (p && !(p.hash || '').startsWith('#/search')) {
+                    await webContents.loadURL(`${youtubeUrl}${searchHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+                }
+                await sleep(700)
+            }
+
+            let p = await probe(webContents).catch(() => null)
+            let out = {
+                ok: true,
+                query: q,
+                results,
+                ...(p ? stateFromProbe(webContents, p) : {})
+            }
+            if (results.length === 0) {
+                out.note = 'no results could be scraped from the search page (the TV should be showing the search screen; see pageText)'
+            }
+            return textResult(out)
+        })
+
+    register('back',
+        'Go back to a previously watched video. With no arguments, returns to the most recent earlier video; pass steps to go further back. History includes videos started by hand, each with when it started playing.',
+        { steps: z.number().int().min(1).max(10).optional().describe('How many videos back to go (default 1)') },
+        async ({ steps }) => {
+            let webContents = getWebContents()
+            let current = null
+            try { current = await probe(webContents) } catch (err) { /* ignore */ }
+            let entry = context.history.popBack(current ? current.watchId : null, steps || 1)
+            if (!entry) return errorResult('no earlier video in the watch history')
+            let result = await playVideoCore(entry.id, { record: false })
+            return textResult({
+                ...result,
+                backTo: { id: entry.id, title: entry.title || null, startedAt: entry.startedAt || null }
+            })
         })
 
     return server
+}
+
+// Watch for videos started by hand (remote control, autoplay chains) so
+// back() covers them too. MCP-initiated switches are recorded by
+// playVideoCore itself; the poller skips transitions it caused.
+function startObserver({ getWindow, context }) {
+    let tick = async () => {
+        try {
+            let win = typeof getWindow === 'function' ? getWindow() : null
+            if (!win || (typeof win.isDestroyed === 'function' && win.isDestroyed())) return
+            let p = await probe(win.webContents)
+            let currentId = p.watchId || null
+            let obs = context.observed
+
+            if (!obs) {
+                context.observed = currentId
+                    ? { id: currentId, title: p.videoTitle || undefined, startedAt: Date.now() }
+                    : null
+                return
+            }
+
+            if (currentId === obs.id) {
+                if (!obs.title && p.videoTitle) obs.title = p.videoTitle
+                return
+            }
+
+            // The on-screen video changed (or playback left to a menu).
+            let mcpCaused = Date.now() - context.lastMcpNavAt < 10000 &&
+                currentId === context.lastMcpNavTarget
+            if (!mcpCaused) {
+                context.history.push({ id: obs.id, title: obs.title, startedAt: obs.startedAt })
+            }
+            context.observed = currentId
+                ? { id: currentId, title: p.videoTitle || undefined, startedAt: Date.now() }
+                : null
+        } catch (err) {
+            // Page mid-navigation or window busy — try again next tick.
+        }
+    }
+    let timer = setInterval(tick, 4000)
+    if (typeof timer.unref === 'function') timer.unref()
+    return timer
 }
 
 function start({ getWindow, userData } = {}) {
@@ -271,6 +786,13 @@ function start({ getWindow, userData } = {}) {
     }
 
     const { StreamableHTTPServerTransport } = require('@modelcontextprotocol/sdk/server/streamableHttp.js')
+
+    let context = {
+        history: createHistory(userData),
+        observed: null,
+        lastMcpNavAt: 0,
+        lastMcpNavTarget: null
+    }
 
     let port = parseInt(process.env.VACUUMTUBE_MCP_PORT, 10)
     if (!isFinite(port) || port <= 0) port = DEFAULT_PORT
@@ -304,8 +826,9 @@ function start({ getWindow, userData } = {}) {
 
             // Stateless mode: a fresh server+transport per request keeps this
             // simple and robust for agent-style calls (initialize, tools/list,
-            // tools/call each work as one-shot requests).
-            let mcpServer = createMcpServer({ getWindow })
+            // tools/call each work as one-shot requests). Shared state
+            // (history, observer) lives in `context`, created once above.
+            let mcpServer = createMcpServer({ getWindow, context })
             let transport = new StreamableHTTPServerTransport({
                 sessionIdGenerator: undefined,
                 enableJsonResponse: true
@@ -336,6 +859,8 @@ function start({ getWindow, userData } = {}) {
     httpServer.listen(port, '127.0.0.1', () => {
         console.log(`[mcp] VacuumTube MCP server listening on http://127.0.0.1:${port}/mcp (${tokens.length} token(s) configured)`)
     })
+
+    startObserver({ getWindow, context })
 
     return httpServer
 }
