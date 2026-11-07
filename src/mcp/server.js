@@ -39,6 +39,12 @@
 // &123 keyboard page — previously any non-letter/non-space character
 // (incl. '@') was silently skipped, so handle searches lost the '@'.
 //
+// v3.15 (Matt's rule, 2026-11-06 21:01–21:04): open_channel navigates
+// DIRECTLY to the channel's saved URL — the search-then-click strategy
+// is deleted and search is never used to reach a channel. On landing
+// the handler pauses any autoplay and presses DOWN 2 immediately,
+// ending parked on the Videos row with the newest upload focused.
+//
 // Phase 2 foundation (v3.13): a structured screen readout (SCREEN_JS,
 // exposed as get_screen) captures what is ACTUALLY rendered — page
 // type, focused element, and visible items with their targets — and
@@ -161,11 +167,11 @@ function channelTargetFrom(input) {
     try {
         let url = new URL(str)
         let chan = url.pathname.match(/\/channel\/(UC[\w-]{22})/)
-        if (chan) return { browseId: chan[1], handle: null, name: null }
+        if (chan) return { browseId: chan[1], handle: null, name: null, url: str }
         let handle = url.pathname.match(/\/@([\w.-]+)/)
-        if (handle) return { browseId: null, handle: handle[1], name: null }
+        if (handle) return { browseId: null, handle: handle[1], name: null, url: str }
         let named = url.pathname.match(/\/(?:user|c)\/([\w.-]+)/)
-        if (named) return { browseId: null, handle: null, name: named[1] }
+        if (named) return { browseId: null, handle: null, name: named[1], url: str }
     } catch (err) {
         // not a URL — fall through
     }
@@ -196,10 +202,10 @@ function parseDurationText(text) {
 // null where the UC… id has not been recorded yet — resolution then
 // goes by handle/name, which open_channel handles.
 const CREATORS = [
-    { name: 'Asmongold TV', handle: 'AsmonTV', browseId: null, aliases: ['asmongold', 'asmon', 'asmongold tv', 'admin gold', 'as gold', 'aspen gold'] },
-    { name: 'Linus Tech Tips', handle: 'LinusTechTips', browseId: null, aliases: ['linus tech tips', 'linus', 'ltt', 'minus tech tips'] },
-    { name: 'Tectone', handle: 'Tectone', browseId: null, aliases: ['tectone'] },
-    { name: 'decoy', handle: 'decoy', browseId: null, aliases: ['decoy', 'decoy voice', 'decoyvoice'] }
+    { name: 'Asmongold TV', handle: 'AsmonTV', url: 'https://www.youtube.com/@AsmonTV', browseId: null, aliases: ['asmongold', 'asmon', 'asmongold tv', 'admin gold', 'as gold', 'aspen gold'] },
+    { name: 'Linus Tech Tips', handle: 'LinusTechTips', url: 'https://www.youtube.com/user/LinusTechTips', browseId: null, aliases: ['linus tech tips', 'linus', 'ltt', 'minus tech tips'] },
+    { name: 'Tectone', handle: 'Tectone', url: 'https://www.youtube.com/@Tectone', browseId: null, aliases: ['tectone'] },
+    { name: 'decoy', handle: 'decoy', url: 'https://www.youtube.com/@decoy', browseId: null, aliases: ['decoy', 'decoy voice', 'decoyvoice'] }
 ]
 
 // Resolve any channel reference (creator name, dictation alias,
@@ -210,22 +216,22 @@ function resolveChannelTarget(input) {
     let key = raw.toLowerCase().replace(/^@/, '')
     for (let c of CREATORS) {
         if (c.handle.toLowerCase() === key || c.name.toLowerCase() === key || c.aliases.includes(key)) {
-            return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name }
+            return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name, url: c.url }
         }
     }
     let t = channelTargetFrom(raw)
     if (t && t.handle) {
         for (let c of CREATORS) {
             if (c.handle.toLowerCase() === t.handle.toLowerCase()) {
-                return { browseId: t.browseId || c.browseId, handle: c.handle, name: c.name, creator: c.name }
+                return { browseId: t.browseId || c.browseId, handle: c.handle, name: c.name, creator: c.name, url: t.url || c.url }
             }
         }
     }
     if (t && t.name) {
         let nk = t.name.toLowerCase()
         for (let c of CREATORS) {
-            if (c.name.toLowerCase() === nk || c.aliases.includes(nk)) {
-                return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name }
+            if (c.name.toLowerCase() === nk || c.handle.toLowerCase() === nk || c.aliases.includes(nk)) {
+                return { browseId: c.browseId, handle: c.handle, name: c.name, creator: c.name, url: t.url || c.url }
             }
         }
     }
@@ -1851,6 +1857,51 @@ function createMcpServer({ getWindow, context }) {
             return { matched: channelScreenMatches(last, target), screen: last }
         }
 
+        // Pause anything playing in the page (a channel page's
+        // featured video autoplays within seconds and takes the
+        // screen over -- Matt's rule is to kill it immediately).
+        let pauseAnyMedia = async () => await evalJS(webContents, `(() => {
+            let n = 0
+            for (const v of document.querySelectorAll('video')) {
+                try { if (!v.paused) { v.pause(); n++ } } catch (e) {}
+            }
+            return n
+        })()`).catch(() => 0)
+
+        // -- Strategy 0 (Matt's rule, 2026-11-06): navigate DIRECTLY
+        // to the channel's saved URL. Search is never used to reach
+        // a channel -- result layouts differ per channel and bury
+        // entries (LTT's members shelf pushes his entry 3 rows
+        // down). The app routes by hash, so the channel path is
+        // applied as the app's route: hash first (cheap), then a
+        // full load of the app on that route (the same fallback
+        // pair play_video uses). Only the rendered-state assertion
+        // can call either a success.
+        let directUrl = target.url ||
+            (target.browseId ? `https://www.youtube.com/channel/${target.browseId}` :
+             target.handle ? `https://www.youtube.com/@${target.handle}` :
+             target.name ? `https://www.youtube.com/user/${encodeURIComponent(target.name.replace(/\s+/g, ''))}` : null)
+        if (directUrl) {
+            let directPath = ''
+            try { directPath = new URL(directUrl).pathname } catch (e) {}
+            if (directPath) {
+                if (first && first.page === 'watch') {
+                    tapKey(webContents, 'Escape')
+                    await sleep(900)
+                }
+                let chanHash = '#' + directPath
+                await pauseAnyMedia()
+                await evalJS(webContents, `location.hash = ${JSON.stringify(chanHash)}; true`).catch(() => {})
+                let r = await waitForChannelScreen(6000)
+                attempts.push({ strategy: 'direct-url-hash', url: directUrl, matched: r.matched })
+                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-hash', attempts, screen: r.screen }
+                await webContents.loadURL(`${youtubeUrl}${chanHash}`, { userAgent: youtubeClientUserAgent }).catch(() => {})
+                r = await waitForChannelScreen(9000)
+                attempts.push({ strategy: 'direct-url-load', url: directUrl, matched: r.matched })
+                if (r.matched) return { ok: true, verified: true, strategy: 'direct-url-load', attempts, screen: r.screen }
+            }
+        }
+
         // Smallest visible element whose own data references the
         // channel (optionally scoped to a subtree). Subscribe buttons
         // also carry the channel ID in their data — never click those.
@@ -1928,152 +1979,10 @@ function createMcpServer({ getWindow, context }) {
             if (r.matched) return { ok: true, verified: true, strategy: 'navigate-event', attempts, screen: r.screen }
         }
 
-        // -- Strategy 4 (handle/name; the primary route for them):
-        // search for the channel, then a trusted MOUSE click on the
-        // rendered channel lockup. (Injected remote keys demonstrably
-        // do not move focus in the search UI; mouse clicks are the
-        // primitive that works there.)
-        let query = target.name || target.handle || ''
-        if (!query && target.browseId) {
-            for (let c of CREATORS) {
-                if (c.browseId && c.browseId === target.browseId) { query = c.name; break }
-            }
-        }
-        if (query) {
-            let before = await probe(webContents).catch(() => null)
-            if (before && before.watchView && before.watchView.active) {
-                tapKey(webContents, 'Escape')
-                await sleep(900)
-            }
-            let pill = await evalJS(webContents, `(() => {
-                const candidates = []
-                for (const el of document.querySelectorAll('*')) {
-                    if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'Search') candidates.push(el)
-                }
-                for (let el of candidates) {
-                    let node = el
-                    for (let i = 0; i < 4 && node; i++) {
-                        const r = node.getBoundingClientRect()
-                        if (r.width > 100 && r.height > 20) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                        node = node.parentElement
-                    }
-                }
-                return null
-            })()`).catch(() => null)
-            if (pill) clickPoint(webContents, pill.x, pill.y)
-            let onSearch = false
-            let sDeadline = Date.now() + 6000
-            while (Date.now() < sDeadline) {
-                let s = await screenSnapshot(webContents).catch(() => null)
-                if (s && s.page === 'search') { onSearch = true; break }
-                await sleep(300)
-            }
-            attempts.push({ strategy: 'search-then-click', searchScreenOpened: onSearch })
-            if (onSearch) {
-                let typeLabel = async (label) => {
-                    let pt = await evalJS(webContents, `(() => {
-                        const kb = document.querySelector('YTLR-SEARCH-KEYBOARD') || document
-                        for (const el of kb.querySelectorAll('*')) {
-                            if (el.children.length === 0 && el.textContent && el.textContent.trim() === ${JSON.stringify('__LABEL__')}) {
-                                const r = el.getBoundingClientRect()
-                                if (r.width > 5 && r.height > 5) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                            }
-                        }
-                        return null
-                    })()`.replace('__LABEL__', label)).catch(() => null)
-                    if (pt) { clickPoint(webContents, pt.x, pt.y); return true }
-                    return false
-                }
-                let readBox = async () => await evalJS(webContents, `(() => {
-                    const box = document.querySelector('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')
-                    if (!box) return ''
-                    const t = (box.innerText || '').replace(/\\s+/g, ' ').trim()
-                    return (t === 'Search') ? '' : t
-                })()`).catch(() => '')
-                // A previously submitted search collapses the
-                // keyboard; click the text box to reopen it.
-                let kbHas = await evalJS(webContents, `(() => {
-                    const kb = document.querySelector('YTLR-SEARCH-KEYBOARD')
-                    if (!kb) return false
-                    for (const el of kb.querySelectorAll('*')) {
-                        if (el.children.length === 0 && el.textContent && el.textContent.trim() === 'A') {
-                            const r = el.getBoundingClientRect()
-                            if (r.width > 5 && r.height > 5) return true
-                        }
-                    }
-                    return false
-                })()`).catch(() => false)
-                if (!kbHas) {
-                    let boxPt = await evalJS(webContents, `(() => {
-                        for (const el of document.querySelectorAll('YTLR-SEARCH-TEXT-BOX, YTLR-TEXT-BOX')) {
-                            const r = el.getBoundingClientRect()
-                            if (r.width > 50 && r.height > 10) return { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2) }
-                        }
-                        return null
-                    })()`).catch(() => null)
-                    if (boxPt) { clickPoint(webContents, boxPt.x, boxPt.y); await sleep(1200) }
-                }
-                // Matt's standing rule: CLEAR any pre-existing
-                // search-box text before typing.
-                let existing = await readBox()
-                for (let i = 0; i < 3 && existing; i++) {
-                    await typeLabel('CLEAR')
-                    await sleep(500)
-                    existing = await readBox()
-                }
-                let typed = ''
-                for (let ch of query) {
-                    if (/[a-z]/i.test(ch)) { if (await typeLabel(ch.toUpperCase())) typed += ch }
-                    else if (ch === ' ') { if (await typeLabel('SPACE')) typed += ' ' }
-                    else if (/[0-9]/.test(ch)) {
-                        if (await typeLabel('&123')) {
-                            await sleep(300)
-                            if (await typeLabel(ch)) typed += ch
-                            await typeLabel('ABC')
-                        }
-                    }
-                    await sleep(280)
-                }
-                attempts.push({ strategy: 'search-then-click', typed })
-                if (typed) {
-                    await typeLabel('SEARCH')
-                    await sleep(2500)
-                    // Find the rendered channel entry: a lockup whose
-                    // text carries an @handle, preferring an exact
-                    // handle/name match.
-                    let findLockup = async () => await evalJS(webContents, `(() => {
-                        const wantHandle = ${JSON.stringify(target.handle ? target.handle.toLowerCase() : '')}
-                        const wantName = ${JSON.stringify(target.name ? target.name.toLowerCase() : '')}
-                        let items = []
-                        for (const c of document.querySelectorAll('YTLR-SEARCH-RESULTS')) {
-                            items.push(...c.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
-                        }
-                        if (items.length === 0) items = Array.from(document.querySelectorAll('YTLR-AVATAR-LOCKUP, YTLR-TILE-RENDERER'))
-                        let firstChannel = null
-                        for (const el of items) {
-                            const r = el.getBoundingClientRect()
-                            if (r.width < 40 || r.height < 20) continue
-                            const text = (el.innerText || '').replace(/\\s+/g, ' ')
-                            if (!/@[\\w.]+/.test(text)) continue
-                            const lower = text.toLowerCase()
-                            const pt = { x: Math.round(r.x + r.width / 2), y: Math.round(r.y + r.height / 2), text: text.slice(0, 140) }
-                            if ((wantHandle && lower.includes('@' + wantHandle)) || (wantName && lower.includes(wantName))) return pt
-                            if (!firstChannel) firstChannel = pt
-                        }
-                        return firstChannel
-                    })()`).catch(() => null)
-                    let lockup = await findLockup()
-                    if (!lockup) { await sleep(1500); lockup = await findLockup() }
-                    attempts.push({ strategy: 'search-then-click', lockup: lockup ? lockup.text : null })
-                    if (lockup) {
-                        clickPoint(webContents, lockup.x, lockup.y)
-                        let r = await waitForChannelScreen(8000)
-                        attempts.push({ strategy: 'search-then-click', landedAssertion: r.matched })
-                        if (r.matched) return { ok: true, verified: true, strategy: 'search-then-click', attempts, screen: r.screen }
-                    }
-                }
-            }
-        }
+        // No search fallback: Matt's rule (2026-11-06) -- channels
+        // are reached by direct URL only. If the direct route and
+        // the browseId strategies above all fail, error honestly
+        // below instead of falling back to search.
 
         let last = await screenSnapshot(webContents).catch(() => null)
         throw new Error('open_channel could not land on the channel page for "' + rawLabel + '" — no strategy passed the rendered-state assertion (page type channel + header identity + that channel\'s videos on screen). Diagnostics: ' + JSON.stringify({
@@ -2082,15 +1991,34 @@ function createMcpServer({ getWindow, context }) {
     }
 
     register('open_channel',
-        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation uses the app\'s own mechanisms: trusted clicks on elements carrying the channel\'s browse endpoint, the app\'s navigation event, and search + a trusted click on the rendered channel entry. No simulated remote keys.',
+        'Navigate VacuumTube to a channel page and verify the landing against the RENDERED screen (channel header identity + that channel\'s videos on screen) — route strings are never accepted as proof, and the tool errors with a screen digest if nothing lands. Accepts a creator name or dictation alias ("Asmongold", "minus tech tips"), a handle (@AsmonTV), a channel ID (UC…), or a channel URL. Navigation goes directly to the channel\'s saved URL first, with the app\'s browse-endpoint mechanisms as backup when a channel ID is known. Search is never used to reach a channel. On landing it pauses any autoplay and moves down 2 rows, ending parked on the Videos row with the newest upload focused.',
         { channel: z.string().describe('Creator name/alias, channel handle (@AsmonTV), channel ID (UC…), or channel URL') },
         async ({ channel }) => {
             let target = resolveChannelTarget(channel)
             if (!target) return errorResult(`Could not parse a channel from: ${channel}`)
             let r = await openChannelCore(target, String(channel))
             let webContents = getWebContents()
+            // Matt's landing rule (2026-11-06): the moment the
+            // channel page lands, pause any autoplay and move DOWN
+            // 2 rows -- fast, before the featured video takes
+            // over -- ending parked on the Videos row, newest
+            // upload focused. Skipped when already on the channel
+            // (focus could be anywhere; don't move it blindly).
+            let parked = false
+            if (r.strategy !== 'already-on-channel') {
+                await evalJS(webContents, `(() => { for (const v of document.querySelectorAll('video')) { try { v.pause() } catch (e) {} } return true })()`).catch(() => {})
+                tapKey(webContents, 'Down')
+                await sleep(150)
+                tapKey(webContents, 'Down')
+                await sleep(700)
+                let parkedScreen = await screenSnapshot(webContents).catch(() => null)
+                if (parkedScreen && channelScreenMatches(parkedScreen, target)) {
+                    r.screen = parkedScreen
+                    parked = true
+                }
+            }
             return textResult({
-                ok: true, verified: true, strategy: r.strategy,
+                ok: true, verified: true, strategy: r.strategy, parked,
                 channel: String(channel),
                 ...(target.browseId ? { browseId: target.browseId } : {}),
                 ...(target.handle ? { handle: target.handle } : {}),
